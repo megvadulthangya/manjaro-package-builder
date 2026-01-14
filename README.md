@@ -121,7 +121,7 @@ AUR_PACKAGES = ["libinput-gestures", "simplescreenrecorder"]
 3. **Repository Database Issues**
    ```bash
    # On VPS:
-   cd /var/www/repo
+   cd /var/www/your_repo
    rm your-repo.*
    # Rerun workflow
    ```
