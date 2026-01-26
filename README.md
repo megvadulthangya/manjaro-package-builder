@@ -1,4 +1,4 @@
-# Manjaro Package Builder
+# Manjaro Package Builder The readme, is currently not up to date, not factualy correct!
 
 ![GitHub Actions](https://img.shields.io/github/actions/workflow/status/megvadulthangya/manjaro-package-builder/.github/workflows/workflow.yaml)
 ![License](https://img.shields.io/github/license/megvadulthangya/manjaro-package-builder)
