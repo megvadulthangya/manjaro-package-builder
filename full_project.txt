@@ -1877,13 +1877,17 @@ Repository management modules
 --- FILE: .github/scripts/modules/repo/version_tracker.py ---
 """
 Version tracking for Zero-Residue cleanup policy - SERVER-FIRST ARCHITECTURE
+Enhanced with VCS version resolution and protected artifacts
 """
 
+import os
 import json
 import re
+import subprocess
+import time
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set, Any
+from typing import Dict, List, Tuple, Optional, Set, Any
 from datetime import datetime
 
 from modules.vps.ssh_client import SSHClient
@@ -1891,7 +1895,7 @@ from modules.vps.ssh_client import SSHClient
 
 class VersionTracker:
     """
-    Tracks package versions - SERVER-FIRST ARCHITECTURE
+    Tracks package versions with VCS resolution and protected artifacts
     """
     
     def __init__(self, repo_root: Path, ssh_client: SSHClient, logger: Optional[logging.Logger] = None):
@@ -1907,6 +1911,15 @@ class VersionTracker:
         self.ssh_client = ssh_client
         self.logger = logger or logging.getLogger(__name__)
         
+        # VCS cache for git package versions
+        self._vcs_version_cache: Dict[str, str] = {}
+        
+        # Protected artifacts registry (multi-package PKGBUILD outputs)
+        self._protected_files: Set[str] = set()
+        
+        # Pending deletions queue
+        self._pending_deletions: List[str] = []
+        
         # Target versions: {pkg_name: target_version} - versions we want to keep
         self._target_versions: Dict[str, str] = {}
         
@@ -1916,16 +1929,42 @@ class VersionTracker:
         # Built packages: {pkg_name: built_version} - packages we just built
         self._built_packages: Dict[str, str] = {}
         
-        # Remote inventory cache: {filename: full_path} from VPS
-        self._remote_inventory: Dict[str, str] = {}
-        
         # JSON state file
-        self.state_file = self.repo_root / ".build_tracking" / "vps_state.json"
+        self.state_file = self._get_state_path()
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state: Dict[str, Any] = self._load_state()
         
         # Load remote inventory at initialization
         self._load_remote_inventory()
+    
+    def _get_state_path(self) -> Path:
+        """
+        Get platform-appropriate state file path
+        
+        Returns:
+            Path to state file
+        """
+        # Priority 1: GitHub Actions workspace
+        github_workspace = os.getenv('GITHUB_WORKSPACE')
+        if github_workspace:
+            workspace_path = Path(github_workspace)
+            if workspace_path.exists():
+                state_path = workspace_path / ".build_tracking" / "vps_state.json"
+                self.logger.info(f"Using GitHub workspace state path: {state_path}")
+                return state_path
+        
+        # Priority 2: Repository root
+        repo_state_path = self.repo_root / ".build_tracking" / "vps_state.json"
+        if self.repo_root.exists():
+            self.logger.info(f"Using repository state path: {repo_state_path}")
+            return repo_state_path
+        
+        # Priority 3: User home directory
+        home_dir = Path.home()
+        home_state_path = home_dir / ".build_tracking" / "vps_state.json"
+        home_state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Using home directory state path: {home_state_path}")
+        return home_state_path
     
     def _load_state(self) -> Dict[str, Any]:
         """Load state from JSON file"""
@@ -1945,20 +1984,274 @@ class VersionTracker:
     def _load_remote_inventory(self):
         """Load remote inventory at initialization"""
         self.logger.info("🔍 Loading remote inventory...")
-        remote_files = self.ssh_client.get_remote_file_list()
+        remote_files = self.ssh_client.get_cached_inventory(force_refresh=True)
         
-        for file_path in remote_files:
-            filename = Path(file_path).name
-            self._remote_inventory[filename] = file_path
+        self.logger.info(f"📋 Remote inventory loaded: {len(remote_files)} files")
+    
+    def resolve_vcs_version(self, pkg_name: str, pkg_dir: Path, force_refresh: bool = False) -> Optional[Tuple[str, str, str]]:
+        """
+        Resolve VCS package version by running makepkg --printsrcinfo
         
-        self.logger.info(f"📋 Remote inventory loaded: {len(self._remote_inventory)} files")
+        Args:
+            pkg_name: Package name
+            pkg_dir: Directory containing PKGBUILD
+            force_refresh: If True, ignore cache and refresh
+        
+        Returns:
+            Tuple of (pkgver, pkgrel, epoch) or None if failed
+        """
+        # Check cache first
+        cache_key = f"{pkg_name}_{pkg_dir}"
+        if not force_refresh and cache_key in self._vcs_version_cache:
+            version_str = self._vcs_version_cache[cache_key]
+            return self._parse_version_string(version_str)
+        
+        # Determine if this is a VCS package
+        is_vcs_package = self._is_vcs_package(pkg_name, pkg_dir)
+        
+        try:
+            if is_vcs_package:
+                self.logger.info(f"🔍 Resolving VCS version for {pkg_name}...")
+                
+                # For VCS packages, we need to run makepkg --printsrcinfo
+                # This will resolve git commit hashes to actual versions
+                result = subprocess.run(
+                    ['makepkg', '--printsrcinfo'],
+                    cwd=pkg_dir,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=300
+                )
+                
+                if result.returncode == 0 and result.stdout:
+                    version_info = self._extract_version_from_srcinfo(result.stdout)
+                    if version_info:
+                        pkgver, pkgrel, epoch = version_info
+                        version_str = self._format_version_string(pkgver, pkgrel, epoch)
+                        self._vcs_version_cache[cache_key] = version_str
+                        self.logger.info(f"✅ VCS version resolved: {version_str}")
+                        return version_info
+                    else:
+                        self.logger.warning(f"Could not parse version from SRCINFO for {pkg_name}")
+                else:
+                    self.logger.warning(f"makepkg --printsrcinfo failed for {pkg_name}: {result.stderr}")
+            
+            # Fall back to standard .SRCINFO parsing
+            return self._extract_version_from_srcinfo_file(pkg_dir)
+            
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"Timeout resolving VCS version for {pkg_name}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error resolving VCS version for {pkg_name}: {e}")
+            return None
+    
+    def _is_vcs_package(self, pkg_name: str, pkg_dir: Path) -> bool:
+        """
+        Check if package is a VCS package
+        
+        Args:
+            pkg_name: Package name
+            pkg_dir: Package directory
+        
+        Returns:
+            True if VCS package
+        """
+        # Check package name patterns
+        vcs_patterns = ['-git', '_git', '-svn', '_svn', '-hg', '_hg', '-bzr', '_bzr']
+        if any(pattern in pkg_name.lower() for pattern in vcs_patterns):
+            return True
+        
+        # Check PKGBUILD content
+        pkgbuild_path = pkg_dir / "PKGBUILD"
+        if pkgbuild_path.exists():
+            try:
+                with open(pkgbuild_path, 'r') as f:
+                    content = f.read()
+                
+                # Look for VCS URLs
+                vcs_url_patterns = [
+                    r'git\+https?://',
+                    r'https?://.*\.git',
+                    r'svn\+https?://',
+                    r'hg\+https?://',
+                    r'bzr\+https?://'
+                ]
+                
+                for pattern in vcs_url_patterns:
+                    if re.search(pattern, content):
+                        return True
+            except Exception:
+                pass
+        
+        return False
+    
+    def _extract_version_from_srcinfo(self, srcinfo_content: str) -> Optional[Tuple[str, str, Optional[str]]]:
+        """Parse SRCINFO content to extract version information"""
+        pkgver = None
+        pkgrel = None
+        epoch = None
+        
+        lines = srcinfo_content.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Handle key-value pairs
+            if '=' in line:
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                if key == 'pkgver':
+                    pkgver = value
+                elif key == 'pkgrel':
+                    pkgrel = value
+                elif key == 'epoch':
+                    epoch = value
+        
+        if not pkgver or not pkgrel:
+            return None
+        
+        return pkgver, pkgrel, epoch
+    
+    def _extract_version_from_srcinfo_file(self, pkg_dir: Path) -> Optional[Tuple[str, str, Optional[str]]]:
+        """Extract version from .SRCINFO file"""
+        srcinfo_path = pkg_dir / ".SRCINFO"
+        
+        if srcinfo_path.exists():
+            try:
+                with open(srcinfo_path, 'r') as f:
+                    content = f.read()
+                return self._extract_version_from_srcinfo(content)
+            except Exception as e:
+                self.logger.warning(f"Failed to read .SRCINFO: {e}")
+        
+        return None
+    
+    def _parse_version_string(self, version_str: str) -> Optional[Tuple[str, str, Optional[str]]]:
+        """Parse version string into components"""
+        if ':' in version_str:
+            # Has epoch
+            epoch_part, rest = version_str.split(':', 1)
+            epoch = epoch_part
+            if '-' in rest:
+                pkgver, pkgrel = rest.split('-', 1)
+            else:
+                pkgver = rest
+                pkgrel = "1"
+        else:
+            # No epoch
+            epoch = None
+            if '-' in version_str:
+                pkgver, pkgrel = version_str.split('-', 1)
+            else:
+                pkgver = version_str
+                pkgrel = "1"
+        
+        return pkgver, pkgrel, epoch
+    
+    def _format_version_string(self, pkgver: str, pkgrel: str, epoch: Optional[str]) -> str:
+        """Format version components into string"""
+        if epoch and epoch != '0':
+            return f"{epoch}:{pkgver}-{pkgrel}"
+        return f"{pkgver}-{pkgrel}"
+    
+    def register_protected_files(self, pkg_name: str, files: List[str]):
+        """
+        Register protected files that should not be deleted
+        
+        Args:
+            pkg_name: Package name
+            files: List of filenames to protect
+        """
+        protected_count = 0
+        for filename in files:
+            if filename not in self._protected_files:
+                self._protected_files.add(filename)
+                protected_count += 1
+                self.logger.debug(f"🔒 Protected file: {filename}")
+        
+        if protected_count > 0:
+            self.logger.info(f"🔒 Registered {protected_count} protected files for {pkg_name}")
+    
+    def is_protected(self, filename: str) -> bool:
+        """
+        Check if a file is protected from deletion
+        
+        Args:
+            filename: Filename to check
+        
+        Returns:
+            True if file is protected
+        """
+        return filename in self._protected_files
+    
+    def get_protected_files(self) -> Set[str]:
+        """Get all protected files"""
+        return self._protected_files.copy()
+    
+    def clear_protected_files(self):
+        """Clear protected files registry"""
+        self._protected_files.clear()
+        self.logger.debug("Cleared protected files registry")
+    
+    def queue_deletion(self, remote_path: str):
+        """
+        Queue a file for batch deletion
+        
+        Args:
+            remote_path: Full remote path to delete
+        """
+        filename = Path(remote_path).name
+        
+        # Don't queue protected files
+        if self.is_protected(filename):
+            self.logger.debug(f"Skipping protected file: {filename}")
+            return
+        
+        self._pending_deletions.append(remote_path)
+        self.logger.debug(f"Queued for deletion: {filename}")
+    
+    def commit_queued_deletions(self) -> bool:
+        """
+        Execute all queued deletions via SSH client
+        
+        Returns:
+            True if successful
+        """
+        if not self._pending_deletions:
+            return True
+        
+        self.logger.info(f"🔧 Committing {len(self._pending_deletions)} queued deletions...")
+        success = self.ssh_client.commit_queued_deletions()
+        
+        if success:
+            self._pending_deletions.clear()
+        
+        return success
+    
+    def get_pending_deletions(self) -> List[str]:
+        """Get list of pending deletions"""
+        return self._pending_deletions.copy()
+    
+    def clear_pending_deletions(self):
+        """Clear pending deletions queue"""
+        self._pending_deletions.clear()
+        self.logger.debug("Cleared pending deletions queue")
     
     def save_state(self) -> bool:
         """Save state to JSON file"""
         try:
             self.state["metadata"]["last_updated"] = datetime.now().isoformat()
+            self.state["metadata"]["protected_files"] = list(self._protected_files)
+            
             with open(self.state_file, 'w') as f:
                 json.dump(self.state, f, indent=2)
+            
             self.logger.debug(f"Saved state to {self.state_file}")
             return True
         except Exception as e:
@@ -1978,10 +2271,13 @@ class VersionTracker:
         """
         self.logger.debug(f"Checking if {pkg_name} version {version} exists on remote...")
         
+        # Get cached inventory
+        remote_inventory = self.ssh_client.get_cached_inventory()
+        
         # Normalize package name for matching (case-insensitive)
         pkg_name_lower = pkg_name.lower()
         
-        for filename, file_path in self._remote_inventory.items():
+        for filename, file_path in remote_inventory.items():
             # Parse filename to extract name, version, and architecture
             parsed = self._parse_package_filename_with_arch(filename)
             if not parsed:
@@ -2031,10 +2327,13 @@ class VersionTracker:
         """
         self.logger.info(f"🔍 Searching for {pkg_name} on remote server...")
         
+        # Get cached inventory
+        remote_inventory = self.ssh_client.get_cached_inventory()
+        
         # Case-insensitive matching with architecture suffix handling
         pkg_name_lower = pkg_name.lower()
         
-        for filename, file_path in self._remote_inventory.items():
+        for filename, file_path in remote_inventory.items():
             self.logger.debug(f"Checking file: {filename}")
             
             # Parse package name and version from filename
@@ -2254,17 +2553,16 @@ class VersionTracker:
         Args:
             remote_files: Dictionary of {filename: full_path} from VPS
         """
-        self._remote_inventory = remote_files
         self.logger.info(f"📋 Remote inventory updated: {len(remote_files)} files")
     
     def get_remote_inventory(self) -> Dict[str, str]:
         """
-        Get current remote inventory
+        Get current remote inventory from cache
         
         Returns:
             Dictionary of {filename: full_path}
         """
-        return self._remote_inventory.copy()
+        return self.ssh_client.get_cached_inventory()
     
     def get_files_to_keep(self) -> Set[str]:
         """
@@ -2274,8 +2572,9 @@ class VersionTracker:
             Set of filenames that match target versions
         """
         files_to_keep = set()
+        remote_inventory = self.get_remote_inventory()
         
-        for filename in self._remote_inventory:
+        for filename in remote_inventory:
             # Parse filename to extract package name and version
             parsed = self._parse_package_filename(filename)
             if not parsed:
@@ -2309,10 +2608,11 @@ class VersionTracker:
             List of full paths to delete
         """
         files_to_delete = []
+        remote_inventory = self.get_remote_inventory()
         files_to_keep = self.get_files_to_keep()
         
-        for filename, full_path in self._remote_inventory.items():
-            if filename not in files_to_keep:
+        for filename, full_path in remote_inventory.items():
+            if filename not in files_to_keep and not self.is_protected(filename):
                 files_to_delete.append(full_path)
         
         return files_to_delete
@@ -2362,7 +2662,7 @@ class VersionTracker:
     
     def clear_remote_inventory(self) -> None:
         """Clear remote inventory cache"""
-        self._remote_inventory.clear()
+        self.ssh_client.clear_cache()
         self.logger.debug("Cleared remote inventory cache")
     
     def get_target_packages(self) -> Dict[str, str]:
@@ -2386,6 +2686,8 @@ class VersionTracker:
         return {
             "total_packages": len(self.state.get("packages", {})),
             "last_updated": self.state.get("metadata", {}).get("last_updated"),
+            "protected_files": len(self._protected_files),
+            "pending_deletions": len(self._pending_deletions),
         }
 --- FILE: .github/scripts/modules/repo/database_manager.py ---
 """
@@ -3104,6 +3406,7 @@ Handles SSH connections, file operations, and remote command execution
 
 import os
 import shutil
+import time
 import logging
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
@@ -3112,7 +3415,7 @@ from modules.common.shell_executor import ShellExecutor
 
 
 class SSHClient:
-    """Handles SSH connections and remote operations on VPS"""
+    """Handles SSH connections and remote operations on VPS with caching"""
     
     def __init__(self, config: Dict[str, Any], shell_executor: ShellExecutor,
                  logger: Optional[logging.Logger] = None):
@@ -3138,36 +3441,52 @@ class SSHClient:
         # SSH key path
         self.ssh_key_path = Path("/home/builder/.ssh/id_ed25519")
         
-        # Add quiet flag to SSH options to suppress MOTD
+        # Add quiet flag to SSH options
         self.ssh_options_with_quiet = self.ssh_options + ["-q"]
+        
+        # Cache for remote operations
+        self._remote_inventory_cache: Optional[Dict[str, str]] = None
+        self._cache_timestamp: float = 0
+        self._cache_ttl = 300  # 5 minutes
+        
+        # Pending operations
+        self._pending_deletions: List[str] = []
     
-    def delete_remote_files(self, file_list: List[str]) -> bool:
+    def get_cached_inventory(self, force_refresh: bool = False) -> Dict[str, str]:
         """
-        Delete remote files on VPS
+        Get cached remote inventory with TTL
         
         Args:
-            file_list: List of full remote paths to delete
+            force_refresh: If True, ignore cache and refresh
+            
+        Returns:
+            Dictionary of {filename: full_path}
+        """
+        current_time = time.time()
+        
+        if (force_refresh or 
+            not self._remote_inventory_cache or 
+            current_time - self._cache_timestamp > self._cache_ttl):
+            
+            self.logger.info("🔍 Refreshing remote inventory cache...")
+            self._remote_inventory_cache = self._get_remote_file_list_optimized()
+            self._cache_timestamp = current_time
+            self.logger.info(f"📋 Cache updated: {len(self._remote_inventory_cache)} files")
+        else:
+            cache_age = int(current_time - self._cache_timestamp)
+            self.logger.debug(f"📋 Using cached inventory ({cache_age}s old)")
+        
+        return self._remote_inventory_cache.copy()
+    
+    def _get_remote_file_list_optimized(self) -> Dict[str, str]:
+        """
+        Get optimized list of package files from remote server
         
         Returns:
-            True if deletion successful, False otherwise
+            Dictionary of {filename: full_path}
         """
-        if not file_list:
-            self.logger.debug("No files to delete")
-            return True
+        remote_cmd = f"cd {self.remote_dir} && ls -1 *.pkg.tar.* 2>/dev/null || echo ''"
         
-        self.logger.info(f"🗑️ Deleting {len(file_list)} remote file(s)...")
-        
-        # Extract just filenames from full paths
-        filenames = []
-        for file_path in file_list:
-            filename = Path(file_path).name
-            filenames.append(filename)
-        
-        # Build delete command with proper escaping
-        filenames_str = ' '.join([f"'{f}'" for f in filenames])
-        remote_cmd = f"cd {self.remote_dir} && rm -f {filenames_str}"
-        
-        # Use string command with shell=True
         ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
         
         try:
@@ -3180,15 +3499,197 @@ class SSHClient:
             )
             
             if result.returncode == 0:
-                self.logger.info(f"✅ Deleted {len(file_list)} file(s) from VPS")
-                return True
+                files = {}
+                for line in result.stdout.strip().splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("Welcome") and not line.startswith("Last login"):
+                        full_path = f"{self.remote_dir}/{line}"
+                        files[line] = full_path
+                
+                return files
             else:
-                self.logger.warning(f"⚠️ Failed to delete some files: {result.stderr[:200]}")
-                return False
+                self.logger.warning(f"⚠️ Failed to list remote files: {result.stderr[:200]}")
+                return {}
                 
         except Exception as e:
-            self.logger.error(f"❌ Error deleting remote files: {e}")
-            return False
+            self.logger.error(f"❌ Error listing remote files: {e}")
+            return {}
+    
+    def batch_delete(self, file_paths: List[str], batch_size: int = 100) -> bool:
+        """
+        Delete multiple files in batches via single SSH session
+        
+        Args:
+            file_paths: List of full remote paths to delete
+            batch_size: Maximum files per batch to avoid command line limits
+            
+        Returns:
+            True if all deletions successful, False otherwise
+        """
+        if not file_paths:
+            self.logger.debug("No files to delete")
+            return True
+        
+        self.logger.info(f"🗑️ Batch deleting {len(file_paths)} remote file(s)...")
+        
+        # Extract just filenames from full paths
+        all_filenames = []
+        for file_path in file_paths:
+            filename = Path(file_path).name
+            all_filenames.append(filename)
+        
+        # Process in batches
+        success = True
+        total_batches = (len(all_filenames) + batch_size - 1) // batch_size
+        
+        for batch_num in range(total_batches):
+            batch_start = batch_num * batch_size
+            batch_end = batch_start + batch_size
+            batch_filenames = all_filenames[batch_start:batch_end]
+            
+            batch_num_display = batch_num + 1
+            
+            # Build delete command with proper escaping
+            filenames_str = ' '.join([f"'{f}'" for f in batch_filenames])
+            remote_cmd = f"cd {self.remote_dir} && rm -f {filenames_str} && echo 'BATCH_DELETE_SUCCESS_{batch_num_display}'"
+            
+            # Use string command with shell=True
+            ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
+            
+            try:
+                result = self.shell_executor.run(
+                    ssh_cmd,
+                    capture=True,
+                    check=False,
+                    shell=True,
+                    log_cmd=False
+                )
+                
+                if result.returncode == 0 and f"BATCH_DELETE_SUCCESS_{batch_num_display}" in result.stdout:
+                    self.logger.info(f"✅ Batch {batch_num_display}/{total_batches}: Deleted {len(batch_filenames)} files")
+                    
+                    # Update cache by removing deleted files
+                    if self._remote_inventory_cache:
+                        for filename in batch_filenames:
+                            self._remote_inventory_cache.pop(filename, None)
+                else:
+                    self.logger.warning(f"⚠️ Batch {batch_num_display} failed: {result.stderr[:200]}")
+                    success = False
+                    
+            except Exception as e:
+                self.logger.error(f"❌ Error in batch delete {batch_num_display}: {e}")
+                success = False
+        
+        if success:
+            self.logger.info(f"✅ All {len(file_paths)} files deleted successfully")
+        else:
+            self.logger.warning(f"⚠️ Some batch deletions failed")
+        
+        return success
+    
+    def atomic_command_sequence(self, commands: List[str], timeout: int = 60) -> Tuple[bool, str]:
+        """
+        Execute multiple remote commands in a single SSH session using heredoc
+        
+        Args:
+            commands: List of shell commands to execute
+            timeout: Total timeout in seconds
+            
+        Returns:
+            Tuple of (success, combined_output)
+        """
+        if not commands:
+            return True, "No commands to execute"
+        
+        self.logger.info(f"🔧 Executing {len(commands)} commands atomically...")
+        
+        # Build heredoc script
+        heredoc_script = "set -e\n"  # Exit on error
+        heredoc_script += f"cd {self.remote_dir}\n"
+        
+        for i, cmd in enumerate(commands):
+            heredoc_script += f"echo '>>> COMMAND {i+1}: {cmd}'\n"
+            heredoc_script += f"{cmd}\n"
+            heredoc_script += "echo '>>> SUCCESS'\n"
+        
+        heredoc_script += "echo 'ATOMIC_SEQUENCE_COMPLETE'\n"
+        
+        # Escape for SSH
+        escaped_script = heredoc_script.replace('"', '\\"').replace('$', '\\$')
+        
+        # Use heredoc via bash -s
+        ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"bash -s\" << 'EOF'\n{heredoc_script}\nEOF"
+        
+        try:
+            result = self.shell_executor.run(
+                ssh_cmd,
+                capture=True,
+                check=False,
+                timeout=timeout,
+                shell=True,
+                log_cmd=False
+            )
+            
+            combined_output = ""
+            if result.stdout:
+                combined_output += result.stdout
+            
+            if result.returncode == 0 and "ATOMIC_SEQUENCE_COMPLETE" in result.stdout:
+                self.logger.info("✅ Atomic command sequence completed successfully")
+                return True, combined_output
+            else:
+                error_msg = result.stderr[:500] if result.stderr else "No error output"
+                self.logger.error(f"❌ Atomic command sequence failed: {error_msg}")
+                return False, combined_output + f"\nERROR: {error_msg}"
+                
+        except Exception as e:
+            self.logger.error(f"❌ Atomic command sequence exception: {e}")
+            return False, str(e)
+    
+    def queue_deletion(self, remote_path: str):
+        """
+        Queue a file for batch deletion
+        
+        Args:
+            remote_path: Full remote path to delete
+        """
+        self._pending_deletions.append(remote_path)
+    
+    def commit_queued_deletions(self) -> bool:
+        """
+        Execute all queued deletions
+        
+        Returns:
+            True if successful
+        """
+        if not self._pending_deletions:
+            return True
+        
+        self.logger.info(f"🔧 Committing {len(self._pending_deletions)} queued deletions...")
+        success = self.batch_delete(self._pending_deletions)
+        
+        if success:
+            self._pending_deletions.clear()
+        
+        return success
+    
+    def clear_cache(self):
+        """Clear the remote inventory cache"""
+        self._remote_inventory_cache = None
+        self._cache_timestamp = 0
+        self.logger.debug("Cleared remote inventory cache")
+    
+    def invalidate_cache_for_file(self, filename: str):
+        """Remove a specific file from cache"""
+        if self._remote_inventory_cache and filename in self._remote_inventory_cache:
+            del self._remote_inventory_cache[filename]
+            self.logger.debug(f"Invalidated cache entry for: {filename}")
+    
+    # Existing methods remain unchanged but use cache where appropriate
+    
+    def delete_remote_files(self, file_list: List[str]) -> bool:
+        """Legacy method - delegates to batch_delete"""
+        return self.batch_delete(file_list)
     
     def setup_ssh_config(self, ssh_key: Optional[str] = None) -> bool:
         """
@@ -3251,7 +3752,6 @@ class SSHClient:
         """
         self.logger.info("🔍 Testing SSH connection to VPS...")
         
-        # Use string command with shell=True for SSH test
         ssh_test_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"cd {self.remote_dir} && echo SSH_TEST_SUCCESS\""
         
         try:
@@ -3277,67 +3777,13 @@ class SSHClient:
     
     def get_remote_file_list(self) -> List[str]:
         """
-        Get explicit list of package files from remote server with debug logging
+        Get explicit list of package files from remote server (legacy)
         
         Returns:
             List of package filenames
         """
-        # MANDATORY: Use explicit ls command with debug
-        remote_cmd = f"cd {self.remote_dir} && ls -1 *.pkg.tar.zst"
-        
-        # Use string command with shell=True
-        ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
-        
-        self.logger.info(f"🔍 Executing remote file listing command: {ssh_cmd}")
-        
-        try:
-            result = self.shell_executor.run(
-                ssh_cmd,
-                capture=True,
-                check=False,
-                shell=True,
-                log_cmd=True
-            )
-            
-            self.logger.debug(f"RAW SSH OUTPUT: {result.stdout}")
-            self.logger.debug(f"SSH STDERR: {result.stderr}")
-            self.logger.debug(f"SSH RETURN CODE: {result.returncode}")
-            
-            if result.returncode == 0:
-                # Clean output - split lines and remove empty
-                files = []
-                for line in result.stdout.strip().splitlines():
-                    line = line.strip()
-                    if line and not line.startswith("Welcome") and not line.startswith("Last login"):
-                        # Construct full path
-                        full_path = f"{self.remote_dir}/{line}"
-                        files.append(full_path)
-                
-                self.logger.info(f"✅ Found {len(files)} remote package files")
-                if files:
-                    self.logger.debug(f"Files found: {files}")
-                return files
-            else:
-                # If ls fails, try to see what's in the directory
-                self.logger.warning(f"⚠️ ls command failed, trying alternative listing...")
-                debug_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"cd {self.remote_dir} && pwd && ls -la\""
-                debug_result = self.shell_executor.run(
-                    debug_cmd,
-                    capture=True,
-                    check=False,
-                    shell=True,
-                    log_cmd=False
-                )
-                
-                if debug_result.returncode == 0:
-                    self.logger.debug(f"DEBUG DIRECTORY LISTING:\n{debug_result.stdout}")
-                
-                self.logger.warning(f"⚠️ Failed to list remote files: {result.stderr[:200]}")
-                return []
-                
-        except Exception as e:
-            self.logger.error(f"❌ Error listing remote files: {e}")
-            return []
+        inventory = self.get_cached_inventory()
+        return list(inventory.values())
     
     def file_exists(self, remote_path: str) -> bool:
         """
@@ -3352,10 +3798,14 @@ class SSHClient:
         # Extract filename from path
         filename = Path(remote_path).name
         
-        # Use cd into remote_dir and check file
+        # Use cache first
+        inventory = self.get_cached_inventory()
+        if filename in inventory:
+            return True
+        
+        # Fallback to direct check
         remote_cmd = f"cd {self.remote_dir} && test -f \"{filename}\" && echo EXISTS || echo NOT_EXISTS"
         
-        # Use string command with shell=True
         ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
         
         try:
@@ -3368,6 +3818,9 @@ class SSHClient:
             )
             
             if result.returncode == 0 and "EXISTS" in result.stdout:
+                # Update cache
+                if self._remote_inventory_cache is not None:
+                    self._remote_inventory_cache[filename] = remote_path
                 return True
             return False
         except Exception as e:
@@ -3387,10 +3840,8 @@ class SSHClient:
         # Extract filename from path
         filename = Path(remote_path).name
         
-        # Use cd into remote_dir and run sha256sum
         remote_cmd = f"cd {self.remote_dir} && sha256sum \"{filename}\" 2>/dev/null | cut -d' ' -f1"
         
-        # Use string command with shell=True
         ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
         
         try:
@@ -3439,7 +3890,6 @@ class SSHClient:
         fi
         """
         
-        # Use string command with shell=True
         ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
         
         try:
@@ -3486,7 +3936,6 @@ class SSHClient:
         fi
         """
         
-        # Use string command with shell=True
         ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
         
         try:
@@ -3528,10 +3977,14 @@ class SSHClient:
         Returns:
             List of remote file paths
         """
-        # Use cd into remote_dir and find files
+        if pattern == "*.pkg.tar.*":
+            # Use cached inventory for common pattern
+            inventory = self.get_cached_inventory()
+            return list(inventory.values())
+        
+        # For other patterns, fall back to direct query
         remote_cmd = f"cd {self.remote_dir} && find . -maxdepth 1 -type f -name '{pattern}' 2>/dev/null | sed 's|^\./||'"
         
-        # Use string command with shell=True
         ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
         
         self.logger.info(f"Listing remote files with pattern: {pattern}")
@@ -3546,12 +3999,10 @@ class SSHClient:
             )
             
             if result.returncode == 0:
-                # Clean output - split lines and remove empty
                 files = []
                 for line in result.stdout.strip().splitlines():
                     line = line.strip()
                     if line and not line.startswith("Welcome") and not line.startswith("Last login"):
-                        # Construct full path
                         full_path = f"{self.remote_dir}/{line}"
                         files.append(full_path)
                 
@@ -3579,7 +4030,6 @@ class SSHClient:
         # Prepend cd to remote_dir
         remote_cmd = f"cd {self.remote_dir} && {command}"
         
-        # Use string command with shell=True
         ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
         
         try:
@@ -3610,10 +4060,8 @@ class SSHClient:
         """
         self.logger.info("🔍 DEBUG: Listing remote directory contents...")
         
-        # MANDATORY: Run ls -la on remote_dir
         remote_cmd = f"cd {self.remote_dir} && pwd && echo '=== DIRECTORY CONTENTS ===' && ls -la && echo '=== PACKAGE FILES ===' && ls -la *.pkg.tar.* 2>/dev/null || echo 'No package files found'"
         
-        # Use string command with shell=True
         ssh_cmd = f"ssh -q {self.vps_user}@{self.vps_host} \"{remote_cmd}\""
         
         self.logger.debug(f"DEBUG COMMAND: {ssh_cmd}")
@@ -3789,6 +4237,59 @@ class RsyncClient:
             self.logger.error(f"RSYNC retry execution error: {e}")
             return False
     
+    def _build_rsync_command(self, local_files: List[str], local_base_dir: Optional[Path],
+                            delete: bool = False, enhanced_ssh: bool = False) -> str:
+        """
+        Build rsync command with syntax safety (prefixing with ./)
+        
+        Args:
+            local_files: List of local file paths
+            local_base_dir: Base directory for relative paths
+            delete: Whether to add --delete flag
+            enhanced_ssh: Whether to use enhanced SSH options
+        
+        Returns:
+            Rsync command string
+        """
+        # Build file list with safety prefix
+        if local_base_dir:
+            # Use relative paths from base directory with ./ prefix
+            file_args = []
+            for file_path in local_files:
+                rel_path = os.path.relpath(file_path, local_base_dir)
+                # Prefix with ./ to ensure rsync treats it as local file
+                safe_path = f"./{rel_path}"
+                file_args.append(f"'{safe_path}'")
+        else:
+            # Use absolute paths with ./ prefix
+            file_args = []
+            for file_path in local_files:
+                # Extract just the filename and prefix with ./
+                filename = os.path.basename(file_path)
+                safe_path = f"./{filename}"
+                file_args.append(f"'{safe_path}'")
+        
+        file_args_str = ' '.join(file_args)
+        
+        # Build SSH options
+        if enhanced_ssh:
+            ssh_opts = '-e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -q"'
+        else:
+            ssh_opts = f'-e "ssh {self.ssh_opts_str}"' if self.ssh_opts_str else '-q'
+        
+        # Build delete flag
+        delete_flag = '--delete' if delete else ''
+        
+        # Build command
+        if local_base_dir:
+            # Change to base directory and use relative paths with ./ prefix
+            cmd = f"cd '{local_base_dir}' && rsync -avzq --progress --stats {delete_flag} {ssh_opts} {file_args_str} '{self.vps_user}@{self.vps_host}:{self.remote_dir}/'"
+        else:
+            # Use current directory and ./ prefix
+            cmd = f"rsync -avzq --progress --stats {delete_flag} {ssh_opts} {file_args_str} '{self.vps_user}@{self.vps_host}:{self.remote_dir}/'"
+        
+        return cmd.strip()
+    
     def mirror_remote(self, remote_pattern: str, local_dir: Path, 
                       temp_dir: Optional[Path] = None) -> bool:
         """
@@ -3883,52 +4384,6 @@ class RsyncClient:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             return False
     
-    def _build_rsync_command(self, local_files: List[str], local_base_dir: Optional[Path],
-                            delete: bool = False, enhanced_ssh: bool = False) -> str:
-        """
-        Build rsync command
-        
-        Args:
-            local_files: List of local file paths
-            local_base_dir: Base directory for relative paths
-            delete: Whether to add --delete flag
-            enhanced_ssh: Whether to use enhanced SSH options
-        
-        Returns:
-            Rsync command string
-        """
-        # Build file list
-        if local_base_dir:
-            # Use relative paths from base directory
-            file_args = []
-            for file_path in local_files:
-                rel_path = os.path.relpath(file_path, local_base_dir)
-                file_args.append(f"'{rel_path}'")
-        else:
-            # Use absolute paths
-            file_args = [f"'{f}'" for f in local_files]
-        
-        file_args_str = ' '.join(file_args)
-        
-        # Build SSH options
-        if enhanced_ssh:
-            ssh_opts = '-e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -q"'
-        else:
-            ssh_opts = f'-e "ssh {self.ssh_opts_str}"' if self.ssh_opts_str else '-q'
-        
-        # Build delete flag
-        delete_flag = '--delete' if delete else ''
-        
-        # Build command
-        if local_base_dir:
-            # Change to base directory and use relative paths
-            cmd = f"cd '{local_base_dir}' && rsync -avzq --progress --stats {delete_flag} {ssh_opts} {file_args_str} '{self.vps_user}@{self.vps_host}:{self.remote_dir}/'"
-        else:
-            # Use absolute paths
-            cmd = f"rsync -avzq --progress --stats {delete_flag} {ssh_opts} {file_args_str} '{self.vps_user}@{self.vps_host}:{self.remote_dir}/'"
-        
-        return cmd.strip()
-    
     def _log_rsync_output(self, result: Any, prefix: str = "RSYNC") -> None:
         """Log rsync output"""
         if result.stdout:
@@ -3955,13 +4410,18 @@ class RsyncClient:
         """
         remote_target = f"{self.remote_dir}/{remote_subdir}" if remote_subdir else self.remote_dir
         
-        # Build rsync command for directory sync
+        # Build rsync command for directory sync with safety prefix
         delete_flag = '--delete' if delete else ''
         
-        rsync_cmd = f"rsync -avzq --progress --stats {delete_flag} -e \"ssh {self.ssh_opts_str}\" '{local_dir}/' '{self.vps_user}@{self.vps_host}:{remote_target}/'"
+        # Use ./ prefix for directory sync
+        rsync_cmd = f"rsync -avzq --progress --stats {delete_flag} -e \"ssh {self.ssh_opts_str}\" './' '{self.vps_user}@{self.vps_host}:{remote_target}/'"
         
         self.logger.info(f"Syncing directory {local_dir} to {remote_target}")
         self.logger.debug(f"RSYNC command: {rsync_cmd.strip()}")
+        
+        # Change to local directory before running rsync
+        old_cwd = os.getcwd()
+        os.chdir(local_dir)
         
         try:
             result = self.shell_executor.run(
@@ -3982,7 +4442,8 @@ class RsyncClient:
         except Exception as e:
             self.logger.error(f"❌ Directory sync error: {e}")
             return False
-
+        finally:
+            os.chdir(old_cwd)
 --- FILE: .github/scripts/modules/orchestrator/__init__.py ---
 """
 Orchestration and workflow management
@@ -4218,6 +4679,7 @@ import sys
 import time
 import re
 import logging
+import shutil
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -4339,6 +4801,9 @@ class PackageBuilder:
         self.local_packages: List[str] = []
         self.aur_packages: List[str] = []
         
+        # Track sanitized artifacts
+        self._sanitized_files: Dict[str, str] = {}  # original -> sanitized
+        
         self.logger.info("✅ PackageBuilder initialized with SERVER-FIRST architecture")
     
     def _sync_pacman_databases_initial(self) -> bool:
@@ -4392,7 +4857,6 @@ class PackageBuilder:
         pkg_dir = aur_dir / pkg_name
         
         # Create fresh clone to get version
-        import shutil
         if pkg_dir.exists():
             shutil.rmtree(pkg_dir, ignore_errors=True)
         
@@ -4472,8 +4936,9 @@ class PackageBuilder:
                                         epoch = value
                             
                             if pkgver and pkgrel:
-                                self.logger.info(f"✅ Git package version resolved: {pkgver}-{pkgrel}")
+                                # Clean up immediately
                                 shutil.rmtree(pkg_dir, ignore_errors=True)
+                                self.logger.info(f"✅ Git package version resolved: {pkgver}-{pkgrel}")
                                 return pkgver, pkgrel, epoch
                     except Exception as e:
                         self.logger.warning(f"Could not get git version via makepkg: {e}")
@@ -4541,6 +5006,73 @@ class PackageBuilder:
             self.logger.info(f"🔄 [BUILD] {pkg_name} {version_str} not on server or outdated. Starting build.")
             return "BUILD"
     
+    def _sanitize_artifacts(self, pkg_name: str, pkg_dir: Path) -> List[Path]:
+        """
+        Sanitize package artifacts by replacing ':' with '_' in filenames
+        
+        Args:
+            pkg_name: Package name
+            pkg_dir: Package directory containing built artifacts
+        
+        Returns:
+            List of sanitized file paths
+        """
+        self.logger.info(f"🔧 Sanitizing artifacts for {pkg_name}...")
+        
+        sanitized_files = []
+        
+        # Find all package files
+        for pkg_file in pkg_dir.glob("*.pkg.tar.*"):
+            original_name = pkg_file.name
+            sanitized_name = original_name.replace(':', '_')
+            
+            if sanitized_name != original_name:
+                # Create sanitized path
+                sanitized_path = pkg_file.with_name(sanitized_name)
+                
+                # Rename the file
+                try:
+                    pkg_file.rename(sanitized_path)
+                    self.logger.info(f"  🔄 Renamed: {original_name} -> {sanitized_name}")
+                    
+                    # Track the sanitization
+                    self._sanitized_files[str(pkg_file)] = str(sanitized_path)
+                    
+                    # Also rename signature if exists
+                    sig_file = pkg_file.with_suffix(pkg_file.suffix + '.sig')
+                    if sig_file.exists():
+                        sanitized_sig = sanitized_path.with_suffix(sanitized_path.suffix + '.sig')
+                        sig_file.rename(sanitized_sig)
+                        self.logger.info(f"  🔄 Renamed signature: {sig_file.name} -> {sanitized_sig.name}")
+                    
+                    sanitized_files.append(sanitized_path)
+                except Exception as e:
+                    self.logger.error(f"Failed to rename {original_name}: {e}")
+                    # Keep original file
+                    sanitized_files.append(pkg_file)
+            else:
+                sanitized_files.append(pkg_file)
+        
+        # Also check output directory for any already moved files
+        output_dir = Path(self.config.get('output_dir', 'built_packages'))
+        for pkg_file in output_dir.glob(f"*{pkg_name}*.pkg.tar.*"):
+            original_name = pkg_file.name
+            if ':' in original_name:
+                sanitized_name = original_name.replace(':', '_')
+                sanitized_path = pkg_file.with_name(sanitized_name)
+                
+                try:
+                    pkg_file.rename(sanitized_path)
+                    self.logger.info(f"  🔄 Renamed in output_dir: {original_name} -> {sanitized_name}")
+                    
+                    # Track the sanitization
+                    self._sanitized_files[str(pkg_file)] = str(sanitized_path)
+                except Exception as e:
+                    self.logger.error(f"Failed to rename in output_dir {original_name}: {e}")
+        
+        self.logger.info(f"✅ Sanitized {len(sanitized_files)} files for {pkg_name}")
+        return sanitized_files
+    
     def _build_aur_packages_server_first(self) -> None:
         """
         Build AUR packages using SERVER-FIRST logic with GIT VERSION FIX
@@ -4582,12 +5114,18 @@ class PackageBuilder:
             success = self.aur_builder.build(pkg_name, None)  # Pass None to force build
             
             if success:
+                # Sanitize artifacts immediately after build
+                aur_dir = Path(self.config.get('aur_build_dir', 'build_aur'))
+                pkg_dir = aur_dir / pkg_name
+                if pkg_dir.exists():
+                    self._sanitize_artifacts(pkg_name, pkg_dir)
+                
                 # Register built package
                 self.version_tracker.register_built_package(pkg_name, version_str)
                 self.build_state.add_built(pkg_name, version_str, is_aur=True)
                 
-                # Cleanup old versions from server
-                self._cleanup_old_versions_on_server(pkg_name, version_str)
+                # Cleanup old versions from server (queued, not executed yet)
+                self._queue_old_version_cleanup(pkg_name, version_str)
             else:
                 self.build_state.add_failed(
                     pkg_name,
@@ -4637,12 +5175,17 @@ class PackageBuilder:
             success = self.local_builder.build(pkg_name, None)  # Pass None to force build
             
             if success:
+                # Sanitize artifacts immediately after build
+                pkg_dir = self.repo_root / pkg_name
+                if pkg_dir.exists():
+                    self._sanitize_artifacts(pkg_name, pkg_dir)
+                
                 # Register built package
                 self.version_tracker.register_built_package(pkg_name, version_str)
                 self.build_state.add_built(pkg_name, version_str, is_aur=False)
                 
-                # Cleanup old versions from server
-                self._cleanup_old_versions_on_server(pkg_name, version_str)
+                # Cleanup old versions from server (queued, not executed yet)
+                self._queue_old_version_cleanup(pkg_name, version_str)
             else:
                 self.build_state.add_failed(
                     pkg_name,
@@ -4651,27 +5194,24 @@ class PackageBuilder:
                     error_message="Local build failed"
                 )
     
-    def _cleanup_old_versions_on_server(self, pkg_name: str, keep_version: str):
+    def _queue_old_version_cleanup(self, pkg_name: str, keep_version: str):
         """
-        SAFE CLEANUP: Remove old versions of package from server
-        but KEEP the specified version
+        Queue old versions for cleanup (but don't execute yet)
         
         Args:
             pkg_name: Package name
             keep_version: Version to keep (newly built/adopted)
         """
-        self.logger.info(f"🧹 Cleaning up old versions of {pkg_name} from server...")
+        self.logger.info(f"🧹 Queuing cleanup of old versions for {pkg_name}...")
         
         # Get all remote files
-        remote_files = self.ssh_client.get_remote_file_list()
+        remote_files = self.ssh_client.get_cached_inventory()
         if not remote_files:
             return
         
         # Find files for this package
-        files_to_delete = []
-        
-        for file_path in remote_files:
-            filename = Path(file_path).name
+        for remote_path in remote_files.values():
+            filename = Path(remote_path).name
             
             # Parse filename
             parsed = self.version_tracker._parse_package_filename_with_arch(filename)
@@ -4684,27 +5224,11 @@ class PackageBuilder:
             if remote_pkg_name.lower() == pkg_name.lower():
                 # Check if it's NOT the version we want to keep
                 if not self.version_tracker._versions_match(remote_version, keep_version):
-                    files_to_delete.append(file_path)
-                    self.logger.debug(f"🗑️ Marking for deletion: {filename} (old version: {remote_version})")
+                    # Queue for deletion (will be executed after successful upload)
+                    self.version_tracker.queue_deletion(remote_path)
+                    self.logger.debug(f"🗑️ Queued for deletion: {filename} (old version: {remote_version})")
                 else:
                     self.logger.debug(f"✅ Keeping: {filename} (current version: {remote_version})")
-        
-        # SAFETY CHECK: Don't delete if we would delete ALL versions
-        if files_to_delete:
-            # Check if we're keeping at least one version
-            keeping_count = len([f for f in remote_files if Path(f).name not in [Path(d).name for d in files_to_delete]])
-            
-            if keeping_count > 0:
-                # Delete in batches (safety)
-                batch_size = 5
-                for i in range(0, len(files_to_delete), batch_size):
-                    batch = files_to_delete[i:i + batch_size]
-                    if self.ssh_client.delete_remote_files(batch):
-                        self.logger.info(f"✅ Deleted {len(batch)} old version(s) of {pkg_name}")
-            else:
-                self.logger.warning(f"⚠️ Safety check failed: Would delete ALL versions of {pkg_name}, skipping cleanup")
-        else:
-            self.logger.info(f"ℹ️ No old versions of {pkg_name} to clean up")
     
     def _update_server_database(self) -> bool:
         """
@@ -4867,6 +5391,15 @@ class PackageBuilder:
         if upload_success:
             self.logger.info("✅ Packages uploaded successfully")
             
+            # Now execute queued deletions
+            self.logger.info("\n🧹 Executing queued cleanup operations...")
+            cleanup_success = self.version_tracker.commit_queued_deletions()
+            
+            if cleanup_success:
+                self.logger.info("✅ Cleanup operations completed")
+            else:
+                self.logger.warning("⚠️ Some cleanup operations failed")
+            
             # Update server database
             return self._update_server_database()
         else:
@@ -4995,6 +5528,7 @@ class PackageBuilder:
             self.logger.info(f"GPG signing:     {'Enabled' if self.gpg_handler.gpg_enabled else 'Disabled'}")
             self.logger.info(f"Git version fix: ✅ Implemented")
             self.logger.info(f"Cleanup safety:  ✅ Version-aware")
+            self.logger.info(f"Sanitized files: {len(self._sanitized_files)}")
             
             # State summary
             state_summary = self.version_tracker.get_state_summary()
@@ -5361,24 +5895,30 @@ Package definitions for Manjaro Package Builder
 # LOCAL packages (from our repository)
 LOCAL_PACKAGES = [
     "gghelper",
-    "gtk2",
-    "awesome-freedesktop-git",
-    "lain-git",
+#    "gtk2",
+#    "awesome-freedesktop-git",
+#    "lain-git",
     "awesome-rofi",
-    "awesome-git",
+#    "awesome-git",
     "awesome-welcome",
-    "tilix-git",
+#    "tilix-git",
     "nordic-backgrounds",
     "awesome-copycats-manjaro",
     "i3lock-fancy-git",
-    "ttf-font-awesome-5",
+#    "ttf-font-awesome-5",
     "nvidia-driver-assistant",
-    "grayjay-bin"
+#    "grayjay-bin"
 ]
 
 # AUR packages (from Arch User Repository)
 AUR_PACKAGES = [
+    "awesome-git",
+    "awesome-freedesktop-git",
+    "lain-git",
+    "ttf-font-awesome-5",
+    "grayjay-bin",
     "libinput-gestures",
+    "gtk2",
     "gtkd",
     "qt5-styleplugins",
     "urxvt-resize-font-git",
@@ -5388,11 +5928,13 @@ AUR_PACKAGES = [
     "tamzen-font",
     "betterlockscreen",
     "nordic-theme",
-    "nordic-darker-theme",
+#    "nordic-darker-theme",
     "geany-nord-theme",
+    "geany-plugin-preview",
     "nordzy-icon-theme",
     "oh-my-posh-bin",
     "fish-done",
+    "tilix-git",
     "find-the-command",
     "p7zip-gui",
     "qownnotes",
@@ -5401,11 +5943,11 @@ AUR_PACKAGES = [
     "simplescreenrecorder",
     "gtkhash-thunar",
     "a4tech-bloody-driver-git",
-    "nordic-bluish-accent-theme",
-    "nordic-bluish-accent-standard-buttons-theme",
-    "nordic-polar-standard-buttons-theme",
-    "nordic-standard-buttons-theme",
-    "nordic-darker-standard-buttons-theme"
+#    "nordic-bluish-accent-theme",
+#    "nordic-bluish-accent-standard-buttons-theme",
+#    "nordic-polar-standard-buttons-theme",
+#    "nordic-standard-buttons-theme",
+#    "nordic-darker-standard-buttons-theme"
 ]
 
 # Optionally, you can also define package groups or categories
