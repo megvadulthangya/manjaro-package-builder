@@ -114,13 +114,55 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/__init__.py ---
 """
 Package Builder Modules
 """
 
 # This file makes the modules directory a Python package
---- FILE: .github/scripts/modules/common/__init__.py ---
+
+ .github/scripts/modules/common/__init__.py ---
 """
 Common utilities for the package builder system
 """
@@ -137,6 +179,23 @@ __all__ = [
     'EnvironmentValidator',
     'ConfigLoader'
 ]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/common/logging_utils.py ---
 """
 Logging utilities for the package builder system
@@ -211,6 +270,29 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
         Configured logger instance
     """
     return logging.getLogger(name)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/common/shell_executor.py ---
 """
 Shell command execution with comprehensive logging, timeout, and debug mode support
@@ -546,6 +628,22 @@ class ShellExecutor:
             subprocess.CompletedProcess
         """
         return self.run(cmd, check=check, log_cmd=False, **kwargs)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/common/environment.py ---
 """
 Environment validation and system path utilities
@@ -763,6 +861,24 @@ class EnvironmentValidator:
                 missing_vars.append(var)
         
         return (len(missing_vars) == 0, missing_vars)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/common/config_loader.py ---
 """
 Configuration loading from environment, config files, and package definitions
@@ -991,6 +1107,23 @@ class ConfigLoader:
             return env_value
         
         return default
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/common/config-manager.py ---
 """
 Centralized configuration manager for Manjaro Package Builder
@@ -1499,12 +1632,34 @@ class ConfigManager:
         self.logger.info("Reloading configuration...")
         self._config_cache.clear()
         self._load_config()
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/build/__init__.py ---
 """
 Package building modules
 """
 
 # Placeholder for build modules - will be implemented in Phase 2
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/build/version_manager.py ---
 """
 Version management for package building
@@ -1773,6 +1928,20 @@ class VersionManager:
             self.logger.debug(f"Could not parse filename {filename}: {e}")
         
         return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/build/aur_builder.py ---
 """
 AUR package builder with SRCINFO-based version comparison and dependency fallback
@@ -2082,6 +2251,24 @@ class AURBuilder:
         # Remove duplicates
         missing_deps = list(set(missing_deps))
         return missing_deps
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/build/local_builder.py ---
 """
 Local package builder with SRCINFO-based version comparison and dependency fallback
@@ -2376,12 +2563,46 @@ class LocalBuilder:
     def get_hokibot_data(self):
         """Get collected hokibot data"""
         return self.hokibot_data
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/repo/__init__.py ---
 """
 Repository management modules
 """
 
 # Placeholder for repository modules - will be implemented in Phase 3
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/repo/version_tracker.py ---
 """
 Version tracking for Zero-Residue cleanup policy - SERVER-FIRST ARCHITECTURE
@@ -3197,6 +3418,20 @@ class VersionTracker:
             "protected_files": len(self._protected_files),
             "pending_deletions": len(self._pending_deletions),
         }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/repo/database_manager.py ---
 """
 Repository database management with additive updates and GPG signing
@@ -3814,6 +4049,27 @@ class DatabaseManager:
             'recovered_list': self._recovered_packages[:10],  # First 10 only
             'missing_list': self._missing_from_db[:10]  # First 10 only
         }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/repo/cleanup_manager.py ---
 """
 Zero-Residue cleanup protocol and atomic path management
@@ -4280,12 +4536,44 @@ class CleanupManager:
             self.logger.debug(f"Could not extract version from {filename}: {e}")
         
         return None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/vps/__init__.py ---
 """
 VPS and remote operations modules
 """
 
 # Placeholder for VPS modules - will be implemented in Phase 4
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/vps/ssh_client.py ---
 """
 SSH client for remote VPS operations
@@ -4977,6 +5265,21 @@ class SSHClient:
         except Exception as e:
             self.logger.error(f"[DEBUG] Error listing remote directory: {e}")
             return False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/vps/rsync_client.py ---
 """
 Rsync client for efficient file transfer between local and remote systems
@@ -5338,12 +5641,36 @@ class RsyncClient:
             return False
         finally:
             os.chdir(old_cwd)
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/orchestrator/__init__.py ---
 """
 Orchestration and workflow management
 """
 
 # Placeholder for orchestrator modules - will be implemented in Phase 5
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/orchestrator/state.py ---
 """
 Build state tracking for package builder system
@@ -5562,6 +5889,25 @@ class BuildState:
             self.stats[key] = 0
         
         self.logger.info("Build state reset for new build")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/orchestrator/package_builder.py ---
 """
 Manjaro Package Builder - Complete Build System with PKGBUILD Synchronization
@@ -7436,12 +7782,37 @@ class PackageBuilder:
             return 1
         finally:
             self._cleanup_git_ssh()
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/gpg/__init__.py ---
 """
 GPG and signing operations
 """
 
 # GPG handler already exists, will be moved in a later phase
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/gpg/gpg_handler.py ---
 """
 GPG Handler Module - Handles GPG key import, signing, and pacman-key operations
@@ -7709,7 +8080,25 @@ class GPGHandler:
                 logger.debug("Cleaned up temporary GPG home directory")
             except Exception as e:
                 logger.warning(f"Could not clean up GPG directory: {e}")
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/sync/__init__.py ---
+
+
+
+
+
+
+
+
+
+
+
 
 --- FILE: .github/scripts/modules/sync/git_sync.py ---
 """
@@ -8195,6 +8584,22 @@ class GitSyncManager:
         except Exception as e:
             self.logger.error(f"Failed to copy file {source}: {e}")
             return False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/modules/sync/pkgbuild_tracker.py ---
 """
 PKGBUILD change tracking and version management module
@@ -8679,6 +9084,24 @@ class PkgbuildTracker:
             self.logger.info(f"Cleaned up {removed_count} old tracking entries")
         
         return removed_count
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/config.py ---
 """
 Configuration file for Manjaro Package Builder
@@ -8742,6 +9165,26 @@ GITHUB_REPO = "megvadulthangya/manjaro-awesome.git"
 
 # Debug mode configuration - when True, bypass logger for critical build output
 DEBUG_MODE = True
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/packages.py ---
 """
 Package definitions for Manjaro Package Builder
@@ -8813,6 +9256,30 @@ PACKAGE_CATEGORIES = {
     "drivers": ["nvidia-driver-assistant", "a4tech-bloody-driver-git"]
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/builder.py ---
 #!/usr/bin/env python3
 """
@@ -8876,6 +9343,24 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 --- FILE: .github/scripts/rsync_upload.py ---
 #!/usr/bin/env python3
 """
@@ -9403,6 +9888,24 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+
+
+
+
+
+
 --- FILE: .github/scripts/package_builder.py ---
 """
 Main Workflow Orchestrator for Manjaro Package Builder
