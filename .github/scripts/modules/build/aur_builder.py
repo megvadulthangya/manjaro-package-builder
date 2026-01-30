@@ -1,202 +1,231 @@
 """
-AUR Builder Module
-Handles cloning and building packages from AUR.
-Implements 'Secret Sauce' legacy logic: Strict dependency resolution, Yay fallback, and robust environment setup.
+AUR Builder Module - Handles AUR package building logic
 """
-import shutil
-import logging
-import os
+
 import re
+import subprocess
+import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-from modules.common.shell_executor import ShellExecutor
+from typing import List
+
+logger = logging.getLogger(__name__)
+
 
 class AURBuilder:
-    """Builds AUR packages using makepkg with robust dependency handling"""
+    """Handles AUR package building and dependency resolution"""
     
-    def __init__(self, config: Dict[str, Any], shell_executor: ShellExecutor, 
-                 version_manager, version_tracker, build_state, logger: Optional[logging.Logger] = None):
-        self.config = config
-        self.shell_executor = shell_executor
-        self.version_manager = version_manager
-        self.logger = logger or logging.getLogger(__name__)
-        self.build_root = config.get('aur_build_dir')
-        self.output_dir = config.get('output_dir')
-        self.packager = config.get('packager_env', 'Unknown Packager')
-
-    def _get_build_env(self) -> Dict[str, str]:
-        """Prepare environment with strict locale and packager settings"""
-        env = os.environ.copy()
-        env['LC_ALL'] = 'C'
-        env['PACKAGER'] = self.packager
-        env['HOME'] = '/home/builder'
-        env['PACMAN_OPTS'] = "--siglevel Never"  # Bypass signature checks
-        return env
-
-    def _purge_old_artifacts(self, pkg_dir: Path):
-        """Clean up old build artifacts before starting"""
-        for f in pkg_dir.glob("*.pkg.tar.zst"):
-            try:
-                f.unlink()
-            except Exception:
-                pass
-        for f in pkg_dir.glob("*.sig"):
-            try:
-                f.unlink()
-            except Exception:
-                pass
-
-    def _install_dependencies_strict(self, pkg_dir: Path) -> bool:
-        """
-        Pre-install dependencies using pacman to ensure DB is fresh.
-        """
-        deps = self.version_manager.extract_dependencies(pkg_dir)
+    def __init__(self, debug_mode: bool = False):
+        self.debug_mode = debug_mode
+    
+    def install_dependencies_strict(self, deps: List[str]) -> bool:
+        """STRICT dependency resolution: pacman first, then yay"""
         if not deps:
             return True
-
-        self.logger.info(f"📦 Pre-installing {len(deps)} dependencies via Pacman...")
-        deps_str = ' '.join(deps)
         
-        # 1. PACMAN SYNC FIRST (Legacy Logic)
-        cmd = f"sudo LC_ALL=C pacman -Sy --needed --noconfirm {deps_str}"
-        res = self.shell_executor.run(cmd, check=False, shell=True)
+        print(f"\nInstalling {len(deps)} dependencies...")
+        logger.info(f"Dependencies to install: {deps}")
         
-        if res.returncode == 0:
-            self.logger.info("✅ Dependencies installed via Pacman")
+        # CRITICAL FIX: Update pacman-key database first
+        print("🔄 Updating pacman-key database...")
+        cmd = "sudo pacman-key --updatedb"
+        result = self._run_cmd(cmd, log_cmd=True, check=False, timeout=300)
+        if result.returncode != 0:
+            logger.warning(f"⚠️ pacman-key --updatedb warning: {result.stderr[:200]}")
+        
+        # Clean dependency names
+        clean_deps = []
+        phantom_packages = set()
+        
+        for dep in deps:
+            dep_clean = re.sub(r'[<=>].*', '', dep).strip()
+            if dep_clean and dep_clean.strip() and not any(x in dep_clean for x in ['$', '{', '}', '(', ')', '[', ']']):
+                if re.search(r'[a-zA-Z0-9]', dep_clean):
+                    # FIX: Hard-filter out phantom package 'lgi'
+                    if dep_clean == 'lgi':
+                        phantom_packages.add('lgi')
+                        logger.warning(f"⚠️ Found phantom package 'lgi' - will be replaced with 'lua-lgi'")
+                        continue
+                    clean_deps.append(dep_clean)
+        
+        # Remove any duplicate entries
+        clean_deps = list(dict.fromkeys(clean_deps))
+        
+        # FIX: If we removed 'lgi', ensure 'lua-lgi' is present
+        if 'lgi' in phantom_packages and 'lua-lgi' not in clean_deps:
+            logger.info("Adding 'lua-lgi' to replace phantom package 'lgi'")
+            clean_deps.append('lua-lgi')
+        
+        if not clean_deps:
+            logger.info("No valid dependencies to install after cleaning")
             return True
-            
-        return True
-
-    def _parse_missing_deps(self, output: str) -> List[str]:
-        """Extract missing package names from makepkg stderr using Legacy Regex"""
-        missing = []
-        patterns = [
-            r"error: target not found: (\S+)",
-            r"Could not find all required packages:",
-            r":: Unable to find (\S+)",
-            r"makepkg: cannot find the '([^']+)'"
-        ]
         
-        for line in output.splitlines():
-            for pattern in patterns:
-                matches = re.findall(pattern, line)
-                for m in matches:
-                    if m and m.strip():
-                        clean_pkg = m.strip().strip("'").strip('"')
-                        missing.append(clean_pkg)
+        logger.info(f"Valid dependencies to install: {clean_deps}")
+        if phantom_packages:
+            logger.info(f"Phantom packages removed: {', '.join(phantom_packages)}")
         
-        return list(set(missing))
-
-    def _install_missing_via_yay(self, deps: List[str]) -> bool:
-        """Install missing dependencies using yay as builder user"""
-        if not deps:
-            return False
-            
-        self.logger.info(f"🚑 Fallback: Installing {len(deps)} missing dependencies via Yay...")
-        deps_str = ' '.join(deps)
+        # CRITICAL FIX: Use Syy instead of Sy to force refresh
+        deps_str = ' '.join(clean_deps)
+        cmd = f"sudo LC_ALL=C pacman -Syy --needed --noconfirm {deps_str}"
+        result = self._run_cmd(cmd, log_cmd=True, check=False, timeout=1200)
         
-        # Legacy Command: Run pacman update then yay as builder
-        cmd = f"sudo LC_ALL=C pacman -Sy && LC_ALL=C yay -S --needed --noconfirm --siglevel Never {deps_str}"
+        if result.returncode == 0:
+            logger.info("✅ All dependencies installed via pacman")
+            return True
         
-        # Execute as builder user via su
-        full_cmd = f"su builder -c '{cmd}'"
+        logger.warning(f"⚠️ pacman failed for some dependencies (exit code: {result.returncode})")
         
-        res = self.shell_executor.run(full_cmd, check=False, shell=True)
-        return res.returncode == 0
-
-    def build(self, pkg_name: str, remote_version: Optional[str] = None) -> bool:
+        # Fallback to AUR (yay) WITHOUT sudo - but first sync pacman
+        cmd = f"sudo LC_ALL=C pacman -Syy && LC_ALL=C yay -S --needed --noconfirm {deps_str}"
+        result = self._run_cmd(cmd, log_cmd=True, check=False, user="builder", timeout=1800)
+        
+        if result.returncode == 0:
+            logger.info("✅ Dependencies installed via yay")
+            return True
+        
+        logger.error(f"❌ Both pacman and yay failed for dependencies")
+        return False
+    
+    def _run_cmd(self, cmd, cwd=None, capture=True, check=True, shell=True, user=None, log_cmd=False, timeout=1800):
         """
-        Clone and build an AUR package with retry logic
+        Run command with comprehensive logging and timeout.
+        
+        CRITICAL FIX: When DEBUG_MODE is True, bypass logger and print directly to stdout
+        to ensure output appears in CI/CD console.
         """
-        self.logger.info(f"🏗️ Building AUR Package: {pkg_name}")
+        if log_cmd:
+            if self.debug_mode:
+                print(f"🔧 [DEBUG] RUNNING COMMAND: {cmd}", flush=True)
+            else:
+                logger.info(f"RUNNING COMMAND: {cmd}")
         
-        work_dir = self.build_root / pkg_name
+        if cwd is None:
+            cwd = Path.cwd()
         
-        # 1. Clean/Prepare Directory
-        if work_dir.exists():
-            shutil.rmtree(work_dir, ignore_errors=True)
-        work_dir.parent.mkdir(parents=True, exist_ok=True)
-
-        # 2. Clone AUR Repository
-        aur_url = f"https://aur.archlinux.org/{pkg_name}.git"
-        clone_cmd = ["git", "clone", "--depth=1", aur_url, str(work_dir)]
-        
-        clone_res = self.shell_executor.run(clone_cmd, check=False)
-        if clone_res.returncode != 0:
-            self.logger.error(f"❌ Failed to clone AUR package {pkg_name}")
-            return False
-
-        # Fix permissions before build
-        self.shell_executor.run(f"chown -R builder:builder {work_dir}", check=False, shell=True)
-
-        # 3. Pre-build Setup
-        self._purge_old_artifacts(work_dir)
-        self._install_dependencies_strict(work_dir)
-
-        # 4. Build Command
-        cmd = ["makepkg", "-si", "--noconfirm", "--clean", "--nocheck"]
-        env = self._get_build_env()
-        
-        try:
-            # First Attempt (As Builder)
-            result = self.shell_executor.run(
-                cmd,
-                cwd=work_dir,
-                check=False,
-                extra_env=env,
-                timeout=self.config.get('makepkg_timeout', {}).get('default', 3600),
-                log_cmd=True,
-                user="builder"
-            )
-
-            # 5. Fallback Logic
-            if result.returncode != 0:
-                self.logger.warning(f"⚠️ First build attempt failed for AUR/{pkg_name}. Checking dependencies...")
-                
-                output = (result.stderr or "") + "\n" + (result.stdout or "")
-                missing_deps = self._parse_missing_deps(output)
-                
-                if missing_deps:
-                    if self._install_missing_via_yay(missing_deps):
-                        self.logger.info("🔄 Retrying build after Yay fallback...")
-                        result = self.shell_executor.run(
-                            cmd,
-                            cwd=work_dir,
-                            check=False,
-                            extra_env=env,
-                            timeout=self.config.get('makepkg_timeout', {}).get('default', 3600),
-                            log_cmd=True,
-                            user="builder"
-                        )
-                    else:
-                        self.logger.error("❌ Yay fallback failed.")
+        if user:
+            import os
+            env = os.environ.copy()
+            env['HOME'] = f'/home/{user}'
+            env['USER'] = user
+            env['LC_ALL'] = 'C'
+            
+            try:
+                sudo_cmd = ['sudo', '-u', user]
+                if shell:
+                    sudo_cmd.extend(['bash', '-c', f'cd "{cwd}" && {cmd}'])
                 else:
-                    self.logger.warning("❌ No specific missing dependencies detected.")
-
-            # 6. Final Verification
-            if result.returncode != 0:
-                self.logger.error(f"❌ makepkg failed for AUR/{pkg_name} (Exit: {result.returncode})")
-                if result.stderr:
-                    self.logger.error(f"Last Error: {result.stderr[:1000]}")
-                return False
-
-            built_files = list(work_dir.glob("*.pkg.tar.zst"))
-            if not built_files:
-                self.logger.error(f"❌ No artifacts produced for AUR/{pkg_name}")
-                return False
-
-            # 7. Move Artifacts
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            for pkg_file in built_files:
-                dest = self.output_dir / pkg_file.name
-                if dest.exists():
-                    dest.unlink()
-                shutil.move(str(pkg_file), str(dest))
-                self.logger.info(f"✅ Generated: {dest.name}")
-
-            shutil.rmtree(work_dir, ignore_errors=True)
-            return True
-
-        except Exception as e:
-            self.logger.error(f"❌ Exception building AUR/{pkg_name}: {e}")
-            return False
+                    sudo_cmd.extend(cmd)
+                
+                result = subprocess.run(
+                    sudo_cmd,
+                    capture_output=capture,
+                    text=True,
+                    check=check,
+                    env=env,
+                    timeout=timeout
+                )
+                
+                # CRITICAL: When in debug mode, bypass logger and print directly
+                if log_cmd or self.debug_mode:
+                    if self.debug_mode:
+                        if result.stdout:
+                            print(f"🔧 [DEBUG] STDOUT:\n{result.stdout}", flush=True)
+                        if result.stderr:
+                            print(f"🔧 [DEBUG] STDERR:\n{result.stderr}", flush=True)
+                        print(f"🔧 [DEBUG] EXIT CODE: {result.returncode}", flush=True)
+                    else:
+                        if result.stdout:
+                            logger.info(f"STDOUT: {result.stdout[:500]}")
+                        if result.stderr:
+                            logger.info(f"STDERR: {result.stderr[:500]}")
+                        logger.info(f"EXIT CODE: {result.returncode}")
+                
+                # CRITICAL: If command failed and we're in debug mode, print full output
+                if result.returncode != 0 and self.debug_mode:
+                    print(f"❌ [DEBUG] COMMAND FAILED: {cmd}", flush=True)
+                    if result.stdout and len(result.stdout) > 500:
+                        print(f"❌ [DEBUG] FULL STDOUT (truncated):\n{result.stdout[:2000]}", flush=True)
+                    if result.stderr and len(result.stderr) > 500:
+                        print(f"❌ [DEBUG] FULL STDERR (truncated):\n{result.stderr[:2000]}", flush=True)
+                
+                return result
+            except subprocess.TimeoutExpired as e:
+                error_msg = f"⚠️ Command timed out after {timeout} seconds: {cmd}"
+                if self.debug_mode:
+                    print(f"❌ [DEBUG] {error_msg}", flush=True)
+                logger.error(error_msg)
+                raise
+            except subprocess.CalledProcessError as e:
+                if log_cmd or self.debug_mode:
+                    error_msg = f"Command failed: {cmd}"
+                    if self.debug_mode:
+                        print(f"❌ [DEBUG] {error_msg}", flush=True)
+                        if hasattr(e, 'stdout') and e.stdout:
+                            print(f"❌ [DEBUG] EXCEPTION STDOUT:\n{e.stdout}", flush=True)
+                        if hasattr(e, 'stderr') and e.stderr:
+                            print(f"❌ [DEBUG] EXCEPTION STDERR:\n{e.stderr}", flush=True)
+                    else:
+                        logger.error(error_msg)
+                if check:
+                    raise
+                return e
+        else:
+            try:
+                import os
+                env = os.environ.copy()
+                env['LC_ALL'] = 'C'
+                
+                result = subprocess.run(
+                    cmd,
+                    cwd=cwd,
+                    shell=shell,
+                    capture_output=capture,
+                    text=True,
+                    check=check,
+                    env=env,
+                    timeout=timeout
+                )
+                
+                # CRITICAL: When in debug mode, bypass logger and print directly
+                if log_cmd or self.debug_mode:
+                    if self.debug_mode:
+                        if result.stdout:
+                            print(f"🔧 [DEBUG] STDOUT:\n{result.stdout}", flush=True)
+                        if result.stderr:
+                            print(f"🔧 [DEBUG] STDERR:\n{result.stderr}", flush=True)
+                        print(f"🔧 [DEBUG] EXIT CODE: {result.returncode}", flush=True)
+                    else:
+                        if result.stdout:
+                            logger.info(f"STDOUT: {result.stdout[:500]}")
+                        if result.stderr:
+                            logger.info(f"STDERR: {result.stderr[:500]}")
+                        logger.info(f"EXIT CODE: {result.returncode}")
+                
+                # CRITICAL: If command failed and we're in debug mode, print full output
+                if result.returncode != 0 and self.debug_mode:
+                    print(f"❌ [DEBUG] COMMAND FAILED: {cmd}", flush=True)
+                    if result.stdout and len(result.stdout) > 500:
+                        print(f"❌ [DEBUG] FULL STDOUT (truncated):\n{result.stdout[:2000]}", flush=True)
+                    if result.stderr and len(result.stderr) > 500:
+                        print(f"❌ [DEBUG] FULL STDERR (truncated):\n{result.stderr[:2000]}", flush=True)
+                
+                return result
+            except subprocess.TimeoutExpired as e:
+                error_msg = f"⚠️ Command timed out after {timeout} seconds: {cmd}"
+                if self.debug_mode:
+                    print(f"❌ [DEBUG] {error_msg}", flush=True)
+                logger.error(error_msg)
+                raise
+            except subprocess.CalledProcessError as e:
+                if log_cmd or self.debug_mode:
+                    error_msg = f"Command failed: {cmd}"
+                    if self.debug_mode:
+                        print(f"❌ [DEBUG] {error_msg}", flush=True)
+                        if hasattr(e, 'stdout') and e.stdout:
+                            print(f"❌ [DEBUG] EXCEPTION STDOUT:\n{e.stdout}", flush=True)
+                        if hasattr(e, 'stderr') and e.stderr:
+                            print(f"❌ [DEBUG] EXCEPTION STDERR:\n{e.stderr}", flush=True)
+                    else:
+                        logger.error(error_msg)
+                if check:
+                    raise
+                return e

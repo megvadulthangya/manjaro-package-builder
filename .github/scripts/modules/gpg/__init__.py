@@ -1,5 +1,3 @@
 """
-GPG Modules
+GPG module for key handling and signing
 """
-from .gpg_handler import GPGHandler
-__all__ = ['GPGHandler']

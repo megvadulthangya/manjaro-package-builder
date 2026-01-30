@@ -1,107 +1,75 @@
 """
-Configuration loader
-Strictly loads configuration from config.py and merges with environment variables.
-NO default paths or business logic allowed here.
+Config Loader Module - Handles configuration loading and validation
 """
 
 import os
 import sys
-import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+
 
 class ConfigLoader:
-    """
-    Loads configuration from config module.
-    """
+    """Handles configuration loading and validation"""
     
-    def __init__(self, repo_root: Path, logger: Optional[logging.Logger] = None):
-        """
-        Initialize ConfigLoader
+    @staticmethod
+    def get_repo_root():
+        """Get the repository root directory reliably"""
+        github_workspace = os.getenv('GITHUB_WORKSPACE')
+        if github_workspace:
+            workspace_path = Path(github_workspace)
+            if workspace_path.exists():
+                return workspace_path
         
-        Args:
-            repo_root: Repository root directory
-            logger: Optional logger instance
-        """
-        self.repo_root = repo_root
-        self.logger = logger or logging.getLogger(__name__)
-        self._config_cache: Dict[str, Any] = {}
-
-    def load_config(self) -> Dict[str, Any]:
-        """
-        Load configuration from config.py
+        container_workspace = Path('/__w/manjaro-awesome/manjaro-awesome')
+        if container_workspace.exists():
+            return container_workspace
         
-        Returns:
-            Dictionary with configuration values
-        """
-        config_dict = {}
+        # Get script directory and go up to repo root
+        script_path = Path(__file__).resolve()
+        repo_root = script_path.parent.parent.parent.parent
+        if repo_root.exists():
+            return repo_root
         
-        # Add script directory to sys.path to find config.py
-        script_dir = self.repo_root / ".github" / "scripts"
-        if script_dir.exists():
-            sys.path.insert(0, str(script_dir))
-            
+        return Path.cwd()
+    
+    @staticmethod
+    def load_environment_config():
+        """Load configuration from environment variables"""
+        return {
+            'vps_user': os.getenv('VPS_USER'),
+            'vps_host': os.getenv('VPS_HOST'),
+            'ssh_key': os.getenv('VPS_SSH_KEY'),
+            'repo_server_url': os.getenv('REPO_SERVER_URL', ''),
+            'remote_dir': os.getenv('REMOTE_DIR'),
+            'repo_name': os.getenv('REPO_NAME'),
+        }
+    
+    @staticmethod
+    def load_from_python_config():
+        """Load configuration from config.py if available"""
         try:
-            import config
-            
-            # Map config module attributes to dict
-            # We explicitly map known keys to ensure structure
-            
-            # Repository
-            config_dict['repo_name'] = getattr(config, 'REPO_NAME', '')
-            config_dict['repo_db_name'] = getattr(config, 'REPO_DB_NAME', '')
-            config_dict['github_repo'] = getattr(config, 'GITHUB_REPO', '')
-            
-            # Paths
-            config_dict['output_dir'] = self.repo_root / getattr(config, 'OUTPUT_DIR', 'built_packages')
-            config_dict['build_tracking_dir'] = self.repo_root / getattr(config, 'BUILD_TRACKING_DIR', '.build_tracking')
-            config_dict['aur_build_dir'] = self.repo_root / getattr(config, 'AUR_BUILD_DIR', 'build_aur')
-            config_dict['mirror_temp_dir'] = Path(getattr(config, 'MIRROR_TEMP_DIR', '/tmp/repo_mirror'))
-            config_dict['sync_clone_dir'] = Path(getattr(config, 'SYNC_CLONE_DIR', '/tmp/repo_gitclone'))
-            config_dict['repo_root'] = self.repo_root
-            
-            # Secrets / Env
-            config_dict['vps_user'] = getattr(config, 'VPS_USER', '')
-            config_dict['vps_host'] = getattr(config, 'VPS_HOST', '')
-            config_dict['vps_ssh_key'] = getattr(config, 'VPS_SSH_KEY', '')
-            config_dict['remote_dir'] = getattr(config, 'REMOTE_DIR', '')
-            config_dict['ci_push_ssh_key'] = getattr(config, 'CI_PUSH_SSH_KEY', '')
-            config_dict['ssh_repo_url'] = getattr(config, 'SSH_REPO_URL', '')
-            
-            # GPG
-            config_dict['gpg_private_key'] = getattr(config, 'GPG_PRIVATE_KEY', '')
-            config_dict['gpg_key_id'] = getattr(config, 'GPG_KEY_ID', '')
-            
-            # Identity
-            config_dict['packager_env'] = getattr(config, 'PACKAGER_ID', '')
-            config_dict['packager_id'] = getattr(config, 'PACKAGER_ID', '') # Alias
-            
-            # Build Settings
-            config_dict['ssh_options'] = getattr(config, 'SSH_OPTIONS', [])
-            config_dict['aur_urls'] = getattr(config, 'AUR_URLS', [])
-            config_dict['makepkg_timeout'] = getattr(config, 'MAKEPKG_TIMEOUT', {})
-            config_dict['debug_mode'] = getattr(config, 'DEBUG_MODE', False)
-            
-            self.logger.info("🔧 Configuration loaded from config.py")
-            self.logger.debug(f"Repo Name: {config_dict['repo_name']}")
-            self.logger.debug(f"Remote Dir: {config_dict['remote_dir']}")
-            
-            return config_dict
-            
-        except ImportError as e:
-            self.logger.error(f"❌ Could not import config.py: {e}")
-            sys.exit(1)
-        except Exception as e:
-            self.logger.error(f"❌ Error loading config: {e}")
-            sys.exit(1)
-
-    def get_package_lists(self) -> Any:
-        """
-        Get package lists from packages.py
-        """
-        try:
-            import packages
-            return packages.LOCAL_PACKAGES, packages.AUR_PACKAGES
+            import scripts.config as config_module
+            return {
+                'output_dir': getattr(config_module, 'OUTPUT_DIR', 'built_packages'),
+                'build_tracking_dir': getattr(config_module, 'BUILD_TRACKING_DIR', '.build_tracking'),
+                'mirror_temp_dir': getattr(config_module, 'MIRROR_TEMP_DIR', '/tmp/repo_mirror'),
+                'sync_clone_dir': getattr(config_module, 'SYNC_CLONE_DIR', '/tmp/manjaro-awesome-gitclone'),
+                'aur_urls': getattr(config_module, 'AUR_URLS', ["https://aur.archlinux.org/{pkg_name}.git", "git://aur.archlinux.org/{pkg_name}.git"]),
+                'aur_build_dir': getattr(config_module, 'AUR_BUILD_DIR', 'build_aur'),
+                'ssh_options': getattr(config_module, 'SSH_OPTIONS', ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes"]),
+                'github_repo': os.getenv('GITHUB_REPO', getattr(config_module, 'GITHUB_REPO', 'megvadulthangya/manjaro-awesome.git')),
+                'packager_id': getattr(config_module, 'PACKAGER_ID', 'Maintainer <no-reply@gshoots.hu>'),
+                'debug_mode': getattr(config_module, 'DEBUG_MODE', False),
+            }
         except ImportError:
-            self.logger.error("❌ Could not import packages.py")
-            sys.exit(1)
+            return {
+                'output_dir': 'built_packages',
+                'build_tracking_dir': '.build_tracking',
+                'mirror_temp_dir': '/tmp/repo_mirror',
+                'sync_clone_dir': '/tmp/manjaro-awesome-gitclone',
+                'aur_urls': ["https://aur.archlinux.org/{pkg_name}.git", "git://aur.archlinux.org/{pkg_name}.git"],
+                'aur_build_dir': 'build_aur',
+                'ssh_options': ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes"],
+                'github_repo': 'megvadulthangya/manjaro-awesome.git',
+                'packager_id': 'Maintainer <no-reply@gshoots.hu>',
+                'debug_mode': False,
+            }

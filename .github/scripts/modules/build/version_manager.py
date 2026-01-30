@@ -1,51 +1,69 @@
 """
-Version management for package building
-Handles version extraction, comparison, PKGBUILD updates, and Upstream Checks.
+Version Manager Module - Handles version extraction, comparison, and management
 """
 
-import re
 import os
 import subprocess
 import logging
-import requests
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional
+
+logger = logging.getLogger(__name__)
+
 
 class VersionManager:
-    """Manages package version extraction, comparison, and parsing"""
+    """Handles package version extraction, comparison, and management"""
     
-    def __init__(self, shell_executor, logger: Optional[logging.Logger] = None):
-        self.shell_executor = shell_executor
-        self.logger = logger or logging.getLogger(__name__)
-
-    def extract_from_pkgbuild(self, pkg_dir: Path) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-        """Extract version from PKGBUILD using makepkg --printsrcinfo"""
+    def extract_version_from_srcinfo(self, pkg_dir: Path) -> Tuple[str, str, Optional[str]]:
+        """Extract pkgver, pkgrel, and epoch from .SRCINFO or makepkg --printsrcinfo output"""
+        srcinfo_path = pkg_dir / ".SRCINFO"
+        
+        # First try to read existing .SRCINFO
+        if srcinfo_path.exists():
+            try:
+                with open(srcinfo_path, 'r') as f:
+                    srcinfo_content = f.read()
+                return self._parse_srcinfo_content(srcinfo_content)
+            except Exception as e:
+                logger.warning(f"Failed to parse existing .SRCINFO: {e}")
+        
+        # Generate .SRCINFO using makepkg --printsrcinfo
         try:
             result = subprocess.run(
                 ['makepkg', '--printsrcinfo'],
                 cwd=pkg_dir,
                 capture_output=True,
                 text=True,
-                check=False,
-                timeout=300
+                check=False
             )
             
             if result.returncode == 0 and result.stdout:
+                # Also write to .SRCINFO for future use
+                with open(srcinfo_path, 'w') as f:
+                    f.write(result.stdout)
                 return self._parse_srcinfo_content(result.stdout)
-            
-            return None, None, None
+            else:
+                logger.warning(f"makepkg --printsrcinfo failed: {result.stderr}")
+                raise RuntimeError(f"Failed to generate .SRCINFO: {result.stderr}")
+                
         except Exception as e:
-            self.logger.error(f"Error extracting version: {e}")
-            return None, None, None
-
-    def _parse_srcinfo_content(self, content: str) -> Tuple[str, str, Optional[str]]:
-        """Parse SRCINFO content"""
+            logger.error(f"Error running makepkg --printsrcinfo: {e}")
+            raise
+    
+    def _parse_srcinfo_content(self, srcinfo_content: str) -> Tuple[str, str, Optional[str]]:
+        """Parse SRCINFO content to extract version information"""
         pkgver = None
         pkgrel = None
         epoch = None
         
-        for line in content.splitlines():
+        lines = srcinfo_content.strip().split('\n')
+        
+        for line in lines:
             line = line.strip()
+            if not line:
+                continue
+            
+            # Handle key-value pairs
             if '=' in line:
                 key, value = line.split('=', 1)
                 key = key.strip()
@@ -58,110 +76,137 @@ class VersionManager:
                 elif key == 'epoch':
                     epoch = value
         
+        if not pkgver or not pkgrel:
+            raise ValueError("Could not extract pkgver and pkgrel from .SRCINFO")
+        
         return pkgver, pkgrel, epoch
-
-    def extract_dependencies(self, pkg_dir: Path) -> List[str]:
-        """Extract depends and makedepends from SRCINFO"""
-        deps = []
-        try:
-            # We assume makepkg --printsrcinfo works even if deps are missing
-            result = subprocess.run(
-                ['makepkg', '--printsrcinfo'],
-                cwd=pkg_dir,
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    line = line.strip()
-                    if '=' in line:
-                        key, val = line.split('=', 1)
-                        key = key.strip()
-                        val = val.strip()
-                        if key in ('depends', 'makedepends'):
-                            # Remove version constraints (e.g., 'gtk3>=3.0')
-                            pkg_name = re.split(r'[<>=]', val)[0]
-                            if pkg_name:
-                                deps.append(pkg_name)
-        except Exception as e:
-            self.logger.error(f"Failed to extract dependencies: {e}")
-            
-        return deps
-
+    
     def get_full_version_string(self, pkgver: str, pkgrel: str, epoch: Optional[str]) -> str:
-        """Construct full version string"""
+        """Construct full version string from components"""
         if epoch and epoch != '0':
             return f"{epoch}:{pkgver}-{pkgrel}"
         return f"{pkgver}-{pkgrel}"
-
-    def check_upstream_version(self, pkg_name: str) -> Optional[str]:
-        """Check AUR RPC for version string"""
-        try:
-            url = f"https://aur.archlinux.org/rpc/?v=5&type=info&arg[]={pkg_name}"
-            response = requests.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data['resultcount'] > 0:
-                    result = data['results'][0]
-                    return result['Version']
-            return None
-        except Exception:
-            return None
-
-    def get_local_git_version(self, pkg_dir: Path) -> Optional[str]:
+    
+    def compare_versions(self, remote_version: Optional[str], pkgver: str, pkgrel: str, epoch: Optional[str]) -> bool:
         """
-        Run pkgver() function if it exists to get dynamic version.
-        Useful for -git packages.
-        """
-        try:
-            if not (pkg_dir / "PKGBUILD").exists():
-                return None
-
-            with open(pkg_dir / "PKGBUILD", 'r') as f:
-                if "pkgver()" not in f.read():
-                    return None
-            
-            # Download sources to calculate version
-            subprocess.run(
-                ["makepkg", "-od", "--noconfirm", "--noprepare"], 
-                cwd=pkg_dir, check=False, capture_output=True
-            )
-            
-            # Run printsrcinfo to get dynamic version
-            res = subprocess.run(
-                ["makepkg", "--printsrcinfo"],
-                cwd=pkg_dir, capture_output=True, text=True, check=False
-            )
-            
-            if res.returncode == 0:
-                ver, rel, ep = self._parse_srcinfo_content(res.stdout)
-                if ver and rel:
-                    return self.get_full_version_string(ver, rel, ep)
-            return None
-        except Exception:
-            return None
-
-    def compare_versions(self, ver_a: str, ver_b: str) -> int:
-        """
-        Compare two versions using vercmp.
-        Returns: >0 if a > b, <0 if a < b, 0 if equal
-        """
-        if not ver_a: return -1
-        if not ver_b: return 1
-        if ver_a == ver_b: return 0
+        Compare versions using vercmp-style logic
         
+        Returns:
+            True if AUR_VERSION > REMOTE_VERSION (should build), False otherwise
+        """
+        # If no remote version exists, we should build
+        if not remote_version:
+            logger.info(f"[DEBUG] Comparing Package: Remote(NONE) vs New({pkgver}-{pkgrel}) -> BUILD TRIGGERED (no remote)")
+            return True
+        
+        # Parse remote version
+        remote_epoch = None
+        remote_pkgver = None
+        remote_pkgrel = None
+        
+        # Check if remote has epoch
+        if ':' in remote_version:
+            remote_epoch_str, rest = remote_version.split(':', 1)
+            remote_epoch = remote_epoch_str
+            if '-' in rest:
+                remote_pkgver, remote_pkgrel = rest.split('-', 1)
+            else:
+                remote_pkgver = rest
+                remote_pkgrel = "1"
+        else:
+            if '-' in remote_version:
+                remote_pkgver, remote_pkgrel = remote_version.split('-', 1)
+            else:
+                remote_pkgver = remote_version
+                remote_pkgrel = "1"
+        
+        # Build version strings for comparison
+        new_version_str = f"{epoch or '0'}:{pkgver}-{pkgrel}"
+        remote_version_str = f"{remote_epoch or '0'}:{remote_pkgver}-{remote_pkgrel}"
+        
+        # Use vercmp for proper version comparison
         try:
-            res = subprocess.run(
-                ['vercmp', ver_a, ver_b],
-                capture_output=True, text=True, check=False
-            )
-            if res.returncode == 0:
-                return int(res.stdout.strip())
-        except Exception:
-            pass
-            
-        # Fallback simple string compare
-        return 1 if ver_a != ver_b else 0
+            result = subprocess.run(['vercmp', new_version_str, remote_version_str], 
+                                  capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                cmp_result = int(result.stdout.strip())
+                
+                if cmp_result > 0:
+                    logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({pkgver}-{pkgrel}) -> BUILD TRIGGERED (new version is newer)")
+                    return True
+                elif cmp_result == 0:
+                    logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({pkgver}-{pkgrel}) -> SKIP (versions identical)")
+                    return False
+                else:
+                    logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({pkgver}-{pkgrel}) -> SKIP (remote version is newer)")
+                    return False
+            else:
+                # Fallback to simple comparison if vercmp fails
+                logger.warning("vercmp failed, using fallback comparison")
+                return self._fallback_version_comparison(remote_version, pkgver, pkgrel, epoch)
+                
+        except Exception as e:
+            logger.warning(f"vercmp comparison failed: {e}, using fallback")
+            return self._fallback_version_comparison(remote_version, pkgver, pkgrel, epoch)
+    
+    def _fallback_version_comparison(self, remote_version: str, pkgver: str, pkgrel: str, epoch: Optional[str]) -> bool:
+        """Fallback version comparison when vercmp is not available"""
+        # Parse remote version
+        remote_epoch = None
+        remote_pkgver = None
+        remote_pkgrel = None
+        
+        if ':' in remote_version:
+            remote_epoch_str, rest = remote_version.split(':', 1)
+            remote_epoch = remote_epoch_str
+            if '-' in rest:
+                remote_pkgver, remote_pkgrel = rest.split('-', 1)
+            else:
+                remote_pkgver = rest
+                remote_pkgrel = "1"
+        else:
+            if '-' in remote_version:
+                remote_pkgver, remote_pkgrel = remote_version.split('-', 1)
+            else:
+                remote_pkgver = remote_version
+                remote_pkgrel = "1"
+        
+        # Compare epochs first
+        if epoch != remote_epoch:
+            try:
+                epoch_int = int(epoch or 0)
+                remote_epoch_int = int(remote_epoch or 0)
+                if epoch_int > remote_epoch_int:
+                    logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({epoch or ''}{pkgver}-{pkgrel}) -> BUILD TRIGGERED (epoch {epoch_int} > {remote_epoch_int})")
+                    return True
+                else:
+                    logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({epoch or ''}{pkgver}-{pkgrel}) -> SKIP (epoch {epoch_int} <= {remote_epoch_int})")
+                    return False
+            except ValueError:
+                if epoch != remote_epoch:
+                    logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({epoch or ''}{pkgver}-{pkgrel}) -> SKIP (epoch string mismatch)")
+                    return False
+        
+        # Compare pkgver
+        if pkgver != remote_pkgver:
+            logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({epoch or ''}{pkgver}-{pkgrel}) -> BUILD TRIGGERED (pkgver different)")
+            return True
+        
+        # Compare pkgrel
+        try:
+            remote_pkgrel_int = int(remote_pkgrel)
+            pkgrel_int = int(pkgrel)
+            if pkgrel_int > remote_pkgrel_int:
+                logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({epoch or ''}{pkgver}-{pkgrel}) -> BUILD TRIGGERED (pkgrel {pkgrel_int} > {remote_pkgrel_int})")
+                return True
+            else:
+                logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({epoch or ''}{pkgver}-{pkgrel}) -> SKIP (pkgrel {pkgrel_int} <= {remote_pkgrel_int})")
+                return False
+        except ValueError:
+            if pkgrel != remote_pkgrel:
+                logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({epoch or ''}{pkgver}-{pkgrel}) -> SKIP (pkgrel string mismatch)")
+                return False
+        
+        # Versions are identical
+        logger.info(f"[DEBUG] Comparing Package: Remote({remote_version}) vs New({epoch or ''}{pkgver}-{pkgrel}) -> SKIP (versions identical)")
+        return False

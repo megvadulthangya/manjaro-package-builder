@@ -1,152 +1,251 @@
 """
-Database Manager
-Handles repository database operations using Legacy Logic.
-Uses shell wildcard expansion and manual GPG signing.
+Database Manager Module - Handles repository database operations
 """
+
 import os
-import shutil
-import glob
 import subprocess
+import shutil
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import List, Tuple
 
-from modules.vps.ssh_client import SSHClient
-from modules.vps.rsync_client import RsyncClient
-from modules.gpg.gpg_handler import GPGHandler
+logger = logging.getLogger(__name__)
+
 
 class DatabaseManager:
-    """Manages the Pacman repository database"""
+    """Manages repository database operations"""
     
-    def __init__(self, config: Dict[str, Any], ssh_client: SSHClient, 
-                 rsync_client: RsyncClient, gpg_handler: GPGHandler, logger: Optional[logging.Logger] = None):
-        self.config = config
-        self.ssh_client = ssh_client
-        self.rsync_client = rsync_client
-        self.gpg_handler = gpg_handler
-        self.logger = logger or logging.getLogger(__name__)
-        
-        self.repo_name = config.get('repo_name', 'custom_repo')
-        self._staging_dir: Optional[Path] = None
-
-    def create_staging_dir(self) -> Path:
-        """Create a clean staging directory"""
-        import tempfile
-        self._staging_dir = Path(tempfile.mkdtemp(prefix=f"{self.repo_name}_staging_"))
-        return self._staging_dir
-
-    def cleanup_staging_dir(self):
-        """Remove the staging directory"""
-        if self._staging_dir and self._staging_dir.exists():
-            shutil.rmtree(self._staging_dir, ignore_errors=True)
-
-    def download_existing_database(self) -> bool:
-        """Download existing database files from VPS to staging"""
-        if not self._staging_dir:
-            return False
-            
-        self.logger.info("📥 Downloading existing database...")
-        patterns = [
-            f"{self.repo_name}.db*",
-            f"{self.repo_name}.files*"
-        ]
-        
-        for pattern in patterns:
-            self.rsync_client.mirror_remote(pattern, self._staging_dir)
-        
-        return True
-
-    def update_database_additive(self) -> bool:
+    def __init__(self, config: dict):
         """
-        Update the database using Legacy Logic.
-        1. Remove old DB files.
-        2. Run repo-add with shell wildcard (*.pkg.tar.zst).
-        3. Manually sign files.
+        Initialize DatabaseManager with configuration
+        
+        Args:
+            config: Dictionary containing:
+                - repo_name: Repository name
+                - output_dir: Local output directory
+                - remote_dir: Remote directory on VPS
+                - vps_user: VPS username
+                - vps_host: VPS hostname
         """
-        if not self._staging_dir:
-            self.logger.error("❌ No staging directory active")
+        self.repo_name = config['repo_name']
+        self.output_dir = Path(config['output_dir'])
+        self.remote_dir = config['remote_dir']
+        self.vps_user = config['vps_user']
+        self.vps_host = config['vps_host']
+    
+    def generate_full_database(self, repo_name: str, output_dir: Path, cleanup_manager) -> bool:
+        """
+        Generate repository database from ALL locally available packages
+        
+        🚨 KRITIKUS: Run final validation BEFORE repo-add
+        """
+        print("\n" + "=" * 60)
+        print("PHASE: Repository Database Generation")
+        print("=" * 60)
+        
+        # 🚨 KRITIKUS: Final validation to remove zombie packages
+        cleanup_manager.revalidate_output_dir_before_database()
+        
+        # Get all package files from local output directory
+        all_packages = self._get_all_local_packages()
+        
+        if not all_packages:
+            logger.info("No packages available for database generation")
             return False
         
-        cwd = os.getcwd()
-        os.chdir(self._staging_dir)
+        logger.info(f"Generating database with {len(all_packages)} packages...")
+        logger.info(f"Packages: {', '.join(all_packages[:10])}{'...' if len(all_packages) > 10 else ''}")
+        
+        old_cwd = os.getcwd()
+        os.chdir(self.output_dir)
         
         try:
-            # Identify packages
-            pkgs = glob.glob("*.pkg.tar.zst")
-            if not pkgs:
-                self.logger.info("ℹ️ No packages found in staging. Database update skipped.")
-                return True
+            db_file = f"{repo_name}.db.tar.gz"
             
-            # 1. Clean Old Database Files
-            # We remove them to force a regeneration which is cleaner/safer in CI environments
-            db_files = [
-                f"{self.repo_name}.db",
-                f"{self.repo_name}.db.tar.gz",
-                f"{self.repo_name}.files",
-                f"{self.repo_name}.files.tar.gz"
-            ]
-            for f in db_files:
+            # Clean old database files
+            for f in [f"{repo_name}.db", f"{repo_name}.db.tar.gz", 
+                      f"{repo_name}.files", f"{repo_name}.files.tar.gz"]:
                 if os.path.exists(f):
                     os.remove(f)
-
-            # 2. Run repo-add with Shell Wildcard
-            # Legacy logic: DO NOT use --sign here. We sign later.
-            # Use shell=True to let the shell expand *.pkg.tar.zst
-            db_target = f"{self.repo_name}.db.tar.gz"
-            cmd = f"repo-add {db_target} *.pkg.tar.zst"
             
-            env = os.environ.copy()
-            env['LC_ALL'] = 'C'
+            # Verify each package file exists locally before database generation
+            missing_packages = []
+            valid_packages = []
             
-            self.logger.info(f"RUNNING: {cmd}")
+            for pkg_filename in all_packages:
+                if Path(pkg_filename).exists():
+                    valid_packages.append(pkg_filename)
+                else:
+                    missing_packages.append(pkg_filename)
+            
+            if missing_packages:
+                logger.error(f"❌ CRITICAL: {len(missing_packages)} packages missing locally:")
+                for pkg in missing_packages[:5]:
+                    logger.error(f"   - {pkg}")
+                if len(missing_packages) > 5:
+                    logger.error(f"   ... and {len(missing_packages) - 5} more")
+                return False
+            
+            if not valid_packages:
+                logger.error("No valid package files found for database generation")
+                return False
+            
+            logger.info(f"✅ All {len(valid_packages)} package files verified locally")
+            
+            # Generate database with repo-add using shell=True for wildcard expansion
+            cmd = f"repo-add {db_file} *.pkg.tar.zst"
+            
+            logger.info(f"Running repo-add with shell=True to include ALL packages...")
+            logger.info(f"Command: {cmd}")
+            logger.info(f"Current directory: {os.getcwd()}")
             
             result = subprocess.run(
                 cmd,
-                shell=True,
+                shell=True,  # CRITICAL: Use shell=True for wildcard expansion
                 capture_output=True,
                 text=True,
-                check=False,
-                env=env
+                check=False
             )
             
-            if result.returncode != 0:
-                self.logger.error("❌ repo-add failed!")
-                self.logger.error(f"STDOUT: {result.stdout}")
-                self.logger.error(f"STDERR: {result.stderr}")
-                return False
-            
-            # Verify creation
-            if not Path(db_target).exists():
-                self.logger.error("❌ Database file was not created")
-                return False
-            
-            # 3. Manual Signing (Legacy Logic)
-            if self.gpg_handler.gpg_enabled:
-                self.logger.info("🔐 Manually signing database files...")
-                if not self.gpg_handler.sign_repository_files(self.repo_name, str(self._staging_dir)):
-                    self.logger.error("❌ Failed to sign database files")
-                    return False
-                self.logger.info("✅ Database signed successfully")
+            if result.returncode == 0:
+                logger.info("✅ Database created successfully")
+                
+                # Verify the database was created
+                db_path = Path(db_file)
+                if db_path.exists():
+                    size_mb = db_path.stat().st_size / (1024 * 1024)
+                    logger.info(f"Database size: {size_mb:.2f} MB")
+                    
+                    # CRITICAL: Verify database entries BEFORE upload
+                    logger.info("🔍 Verifying database entries before upload...")
+                    list_cmd = ["tar", "-tzf", db_file]
+                    list_result = subprocess.run(list_cmd, capture_output=True, text=True, check=False)
+                    if list_result.returncode == 0:
+                        db_entries = [line for line in list_result.stdout.split('\n') if line.endswith('/desc')]
+                        logger.info(f"✅ Database contains {len(db_entries)} package entries")
+                        if len(db_entries) == 0:
+                            logger.error("❌❌❌ DATABASE IS EMPTY! This is the root cause of the issue.")
+                            return False
+                        else:
+                            logger.info(f"Sample database entries: {db_entries[:5]}")
+                    else:
+                        logger.warning(f"Could not list database contents: {list_result.stderr}")
+                
+                return True
             else:
-                self.logger.warning("⚠️ GPG disabled, database unsigned")
-
-            self.logger.info("✅ Database regeneration complete")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"❌ Database update exception: {e}")
-            return False
+                logger.error(f"repo-add failed with exit code {result.returncode}:")
+                if result.stdout:
+                    logger.error(f"STDOUT: {result.stdout[:500]}")
+                if result.stderr:
+                    logger.error(f"STDERR: {result.stderr[:500]}")
+                return False
+                
         finally:
-            os.chdir(cwd)
-
-    def upload_updated_files(self) -> bool:
-        """Upload all files from staging to VPS"""
-        if not self._staging_dir:
-            return False
+            os.chdir(old_cwd)
+    
+    def _get_all_local_packages(self) -> List[str]:
+        """Get ALL package files from local output directory (mirrored + newly built)"""
+        print("\n🔍 Getting complete package list from local directory...")
+        
+        local_files = list(self.output_dir.glob("*.pkg.tar.*"))
+        
+        if not local_files:
+            logger.info("ℹ️ No package files found locally")
+            return []
+        
+        local_filenames = [f.name for f in local_files]
+        
+        logger.info(f"📊 Local package count: {len(local_filenames)}")
+        logger.info(f"Sample packages: {local_filenames[:10]}")
+        
+        return local_filenames
+    
+    def check_database_files(self) -> Tuple[List[str], List[str]]:
+        """Check if repository database files exist on server"""
+        print("\n" + "=" * 60)
+        print("STEP 2: Checking existing database files on server")
+        print("=" * 60)
+        
+        db_files = [
+            f"{self.repo_name}.db",
+            f"{self.repo_name}.db.tar.gz",
+            f"{self.repo_name}.files",
+            f"{self.repo_name}.files.tar.gz"
+        ]
+        
+        existing_files = []
+        missing_files = []
+        
+        for db_file in db_files:
+            remote_cmd = f"test -f {self.remote_dir}/{db_file} && echo 'EXISTS' || echo 'MISSING'"
             
-        files = glob.glob(str(self._staging_dir / "*"))
-        if not files:
-            return True
+            ssh_cmd = [
+                "ssh",
+                f"{self.vps_user}@{self.vps_host}",
+                remote_cmd
+            ]
             
-        self.logger.info(f"📤 Uploading {len(files)} files to remote...")
-        return self.rsync_client.upload(files)
+            try:
+                result = subprocess.run(
+                    ssh_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                
+                if result.returncode == 0 and "EXISTS" in result.stdout:
+                    existing_files.append(db_file)
+                    logger.info(f"✅ Database file exists: {db_file}")
+                else:
+                    missing_files.append(db_file)
+                    logger.info(f"ℹ️ Database file missing: {db_file}")
+                    
+            except Exception as e:
+                logger.warning(f"Could not check {db_file}: {e}")
+                missing_files.append(db_file)
+        
+        if existing_files:
+            logger.info(f"Found {len(existing_files)} database files on server")
+        else:
+            logger.info("No database files found on server")
+        
+        return existing_files, missing_files
+    
+    def fetch_existing_database(self, existing_files: List[str]):
+        """Fetch existing database files from server"""
+        if not existing_files:
+            return
+        
+        print("\n📥 Fetching existing database files from server...")
+        
+        for db_file in existing_files:
+            remote_path = f"{self.remote_dir}/{db_file}"
+            local_path = self.output_dir / db_file
+            
+            # Remove local copy if exists
+            if local_path.exists():
+                local_path.unlink()
+            
+            ssh_cmd = [
+                "scp",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=30",
+                f"{self.vps_user}@{self.vps_host}:{remote_path}",
+                str(local_path)
+            ]
+            
+            try:
+                result = subprocess.run(
+                    ssh_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                
+                if result.returncode == 0 and local_path.exists():
+                    size_mb = local_path.stat().st_size / (1024 * 1024)
+                    logger.info(f"✅ Fetched: {db_file} ({size_mb:.2f} MB)")
+                else:
+                    logger.warning(f"⚠️ Could not fetch {db_file}")
+            except Exception as e:
+                logger.warning(f"Could not fetch {db_file}: {e}")
