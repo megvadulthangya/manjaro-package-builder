@@ -4,7 +4,7 @@ Version Tracker Module - Handles package version tracking and comparison
 
 import re
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,11 @@ class VersionTracker:
         self._package_target_versions: Dict[str, str] = {}  # {pkg_name: target_version} - versions we want to keep
         self._built_packages: Dict[str, str] = {}  # {pkg_name: built_version} - packages we just built
         self._upload_successful = False
+        self._desired_inventory: Set[str] = set()  # NEW: Desired inventory for cleanup guard
+    
+    def set_desired_inventory(self, desired_inventory: Set[str]):
+        """Set the desired inventory for cleanup guard"""
+        self._desired_inventory = desired_inventory
     
     def set_upload_successful(self, successful: bool):
         """Set the upload success flag for safety valve"""
@@ -67,7 +72,25 @@ class VersionTracker:
         # 🚨 CRITICAL: Explicitly set target version to remote version
         self._package_target_versions[pkg_name] = remote_version
         
-        logger.info(f"📝 Registered SKIPPED package: {pkg_name} (remote: {remote_version}, target: {remote_version})")
+        logger.info(f"📝 Registered skipped package: {pkg_name} ({remote_version})")
+    
+    def register_split_packages(self, pkg_names: List[str], version: str, is_built: bool = True):
+        """
+        NEW: Register target/skipped versions for ALL pkgname entries in a split/multi-package PKGBUILD.
+        
+        Args:
+            pkg_names: List of package names produced by the PKGBUILD
+            version: The version to register for all packages
+            is_built: True if package was built, False if skipped
+        """
+        for pkg_name in pkg_names:
+            if is_built:
+                self._package_target_versions[pkg_name] = version
+                logger.info(f"📝 Registered split package target version for {pkg_name}: {version}")
+            else:
+                self._skipped_packages[pkg_name] = version
+                self._package_target_versions[pkg_name] = version
+                logger.info(f"📝 Registered split skipped package: {pkg_name} ({version})")
     
     def package_exists(self, pkg_name: str, remote_files: List[str]) -> bool:
         """Check if package exists on server"""
@@ -83,6 +106,37 @@ class VersionTracker:
         
         return False
     
+    def normalize_version_string(self, version_string: str) -> str:
+        """
+        Canonical version normalization: strip architecture suffix and ensure epoch format.
+        
+        Args:
+            version_string: Raw version string that may include architecture suffix
+            
+        Returns:
+            Normalized version string in format epoch:pkgver-pkgrel
+        """
+        if not version_string:
+            return version_string
+            
+        # Remove known architecture suffixes from the end
+        # These are only stripped if they appear as the final token
+        arch_patterns = [r'-x86_64$', r'-any$', r'-i686$', r'-aarch64$', r'-armv7h$', r'-armv6h$']
+        for pattern in arch_patterns:
+            version_string = re.sub(pattern, '', version_string)
+        
+        # Ensure epoch format: if no epoch, prepend "0:"
+        if ':' not in version_string:
+            # Check if there's already a dash in the version part
+            if '-' in version_string:
+                # Already in pkgver-pkgrel format, add epoch
+                version_string = f"0:{version_string}"
+            else:
+                # No dash, assume it's just pkgver, add default pkgrel
+                version_string = f"0:{version_string}-1"
+        
+        return version_string
+    
     def get_remote_version(self, pkg_name: str, remote_files: List[str]) -> Optional[str]:
         """Get the version of a package from remote server using SRCINFO-based extraction"""
         if not remote_files:
@@ -95,19 +149,34 @@ class VersionTracker:
                 base = filename.replace('.pkg.tar.zst', '').replace('.pkg.tar.xz', '')
                 parts = base.split('-')
                 
-                # Find where the package name ends
-                for i in range(len(parts) - 2, 0, -1):
+                # Find where the package name ends and version begins
+                # Package name can have multiple hyphenated parts, so we need to find the split point
+                for i in range(1, len(parts)):
                     possible_name = '-'.join(parts[:i])
-                    if possible_name == pkg_name or possible_name.startswith(pkg_name + '-'):
-                        if len(parts) >= i + 3:
-                            version_part = parts[i]
-                            release_part = parts[i+1]
-                            if i + 1 < len(parts) and parts[i].isdigit() and i + 2 < len(parts):
-                                epoch_part = parts[i]
-                                version_part = parts[i+1]
-                                release_part = parts[i+2]
-                                return f"{epoch_part}:{version_part}-{release_part}"
+                    if possible_name == pkg_name:
+                        # Found the package name boundary
+                        # The remaining parts are: [version, release, architecture] or [epoch, version, release, architecture]
+                        remaining = parts[i:]
+                        
+                        # Handle different cases
+                        if len(remaining) >= 3:
+                            # Check if first part is epoch (all digits)
+                            if remaining[0].isdigit() and len(remaining) >= 4:
+                                # Format: epoch-version-release-architecture
+                                epoch = remaining[0]
+                                version = remaining[1]
+                                release = remaining[2]
+                                # Architecture is remaining[3] but we strip it later
+                                raw_version = f"{epoch}:{version}-{release}"
                             else:
-                                return f"{version_part}-{release_part}"
+                                # Format: version-release-architecture
+                                version = remaining[0]
+                                release = remaining[1]
+                                raw_version = f"{version}-{release}"
+                            
+                            # Normalize to remove architecture and ensure epoch format
+                            normalized = self.normalize_version_string(raw_version)
+                            logger.debug(f"Extracted remote version for {pkg_name}: raw='{raw_version}', normalized='{normalized}'")
+                            return normalized
         
         return None
