@@ -1,4 +1,4 @@
-name: Manjaro Package Builder
+name: Manjaro Package Builder EOF
 
 on:
   workflow_dispatch:
@@ -163,29 +163,6 @@ jobs:
         run: |
           python3 .github/scripts/syntax.py
 
-      - name: Fix PKGBUILD Epoch Issues
-        run: |
-          echo "=== Fixing PKGBUILD epoch issues ==="
-          
-          # Fix awesome-freedesktop-git PKGBUILD (remove epoch)
-          if [ -f "awesome-freedesktop-git/PKGBUILD" ]; then
-            echo "Fixing awesome-freedesktop-git/PKGBUILD..."
-            sed -i '/^epoch=/d' awesome-freedesktop-git/PKGBUILD
-            # Increment pkgrel to ensure new version
-            current_pkgrel=$(grep -oP '^pkgrel=\K\d+' awesome-freedesktop-git/PKGBUILD)
-            if [ -n "$current_pkgrel" ]; then
-              new_pkgrel=$((current_pkgrel + 1))
-              sed -i "s/^pkgrel=.*/pkgrel=$new_pkgrel/" awesome-freedesktop-git/PKGBUILD
-              echo "Updated pkgrel from $current_pkgrel to $new_pkgrel"
-            fi
-          fi
-          
-          # Check for other packages with epoch
-          echo "Checking for other packages with epoch in PKGBUILD..."
-          find . -name "PKGBUILD" -type f -exec grep -l "^epoch=" {} \;
-          
-          echo "✅ PKGBUILD fixes complete"
-
       - name: Prepare Environment
         run: |
           echo "=== Starting Environment Preparation ==="
@@ -279,7 +256,7 @@ jobs:
           ssh-keyscan -H "$VPS_HOST" >> /home/builder/.ssh/known_hosts 2>/dev/null || true
           
           # Create SSH config for reliable connections
-          cat > /home/builder/.ssh/config << 'EOF'
+          cat > /home/builder/.ssh/config <<'EOF'
           Host $VPS_HOST
             HostName $VPS_HOST
             User $VPS_USER
@@ -316,12 +293,18 @@ jobs:
             echo "➕ Adding repository '$REPO_NAME' to pacman.conf"
             
             TEMP_FILE=$(mktemp)
-            echo "" >> "$TEMP_FILE"
-            echo "# Custom repository: $REPO_NAME" >> "$TEMP_FILE"
-            echo "# Repository will be dynamically enabled/disabled by builder.py" >> "$TEMP_FILE"
-            echo "[$REPO_NAME]" >> "$TEMP_FILE"
-            echo "SigLevel = Optional TrustAll" >> "$TEMP_FILE"
-            echo "Server = $REPO_SERVER_URL" >> "$TEMP_FILE"
+            cat > "$TEMP_FILE" <<'EOF'
+          
+          # Custom repository: __REPO_NAME__
+          # Repository will be dynamically enabled/disabled by builder.py
+          [__REPO_NAME__]
+          SigLevel = Optional TrustAll
+          Server = __REPO_SERVER_URL__
+          EOF
+          
+            esc_sed() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+            sed -i "s|__REPO_NAME__|$(esc_sed "$REPO_NAME")|g" "$TEMP_FILE"
+            sed -i "s|__REPO_SERVER_URL__|$(esc_sed "$REPO_SERVER_URL")|g" "$TEMP_FILE"
             
             cat "$TEMP_FILE" >> /etc/pacman.conf
             rm -f "$TEMP_FILE"
@@ -648,36 +631,46 @@ jobs:
           else
             cp -a "$PACMAN_CONF" "${PACMAN_CONF}.bak.cachyos"
 
-            echo "" >> "$PACMAN_CONF"
-            echo "# ==============================" >> "$PACMAN_CONF"
-            echo "# CachyOS repos (repo-only, key via keyserver, no extra installs)" >> "$PACMAN_CONF"
-            echo "# Auto-selected tier: ${tier}" >> "$PACMAN_CONF"
-            echo "# ==============================" >> "$PACMAN_CONF"
-            echo "" >> "$PACMAN_CONF"
+            TMP_CACHYOS=$(mktemp)
+            cat > "$TMP_CACHYOS" <<'EOF'
+          
+          # ==============================
+          # CachyOS repos (repo-only, key via keyserver, no extra installs)
+          # Auto-selected tier: __TIER__
+          # ==============================
+          
+          [__REPO_A__]
+          SigLevel = Required
+          Server = https://mirror.cachyos.org/repo/__ARCH_DIR__/__REPO_A__/
+          
+          [__REPO_B__]
+          SigLevel = Required
+          Server = https://mirror.cachyos.org/repo/__ARCH_DIR__/__REPO_B__/
+          
+          [__REPO_C__]
+          SigLevel = Required
+          Server = https://mirror.cachyos.org/repo/__ARCH_DIR__/__REPO_C__/
+          
+          [cachyos]
+          SigLevel = Required
+          Server = https://mirror.cachyos.org/repo/x86_64/cachyos/
+          
+          EOF
+          
+            esc_sed() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+            sed -i "s|__TIER__|$(esc_sed "$tier")|g" "$TMP_CACHYOS"
+            sed -i "s|__ARCH_DIR__|$(esc_sed "$arch_dir")|g" "$TMP_CACHYOS"
+            sed -i "s|__REPO_A__|$(esc_sed "$repo_a")|g" "$TMP_CACHYOS"
+            sed -i "s|__REPO_B__|$(esc_sed "$repo_b")|g" "$TMP_CACHYOS"
+            sed -i "s|__REPO_C__|$(esc_sed "$repo_c")|g" "$TMP_CACHYOS"
 
-            echo "[${repo_a}]" >> "$PACMAN_CONF"
-            echo "SigLevel = Required" >> "$PACMAN_CONF"
-            echo "Server = https://mirror.cachyos.org/repo/${arch_dir}/${repo_a}/" >> "$PACMAN_CONF"
-            echo "" >> "$PACMAN_CONF"
-
-            echo "[${repo_b}]" >> "$PACMAN_CONF"
-            echo "SigLevel = Required" >> "$PACMAN_CONF"
-            echo "Server = https://mirror.cachyos.org/repo/${arch_dir}/${repo_b}/" >> "$PACMAN_CONF"
-            echo "" >> "$PACMAN_CONF"
-
-            echo "[${repo_c}]" >> "$PACMAN_CONF"
-            echo "SigLevel = Required" >> "$PACMAN_CONF"
-            echo "Server = https://mirror.cachyos.org/repo/${arch_dir}/${repo_c}/" >> "$PACMAN_CONF"
-            echo "" >> "$PACMAN_CONF"
-
-            echo "[cachyos]" >> "$PACMAN_CONF"
-            echo "SigLevel = Required" >> "$PACMAN_CONF"
-            echo "Server = https://mirror.cachyos.org/repo/x86_64/cachyos/" >> "$PACMAN_CONF"
-            echo "" >> "$PACMAN_CONF"
+            cat "$TMP_CACHYOS" >> "$PACMAN_CONF"
+            rm -f "$TMP_CACHYOS"
           fi
 
           echo "CACHYOS: SYNC_DB"
           pacman -Sy --noconfirm
+          pacman -Ss gcc14
           echo "CACHYOS: DONE"
 
       - name: Run Builder with Cache Optimization
