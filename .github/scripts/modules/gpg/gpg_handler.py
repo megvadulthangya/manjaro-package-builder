@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import logging
 from pathlib import Path
+import shlex
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,9 @@ class GPGHandler:
         self.sign_packages_enabled = sign_packages and self.gpg_enabled
         self.gpg_home = None
         self.gpg_env = None
+        # Builder-specific GPG environment
+        self.builder_gpg_home = None
+        self.builder_gpg_env = None
         
         # Safe logging - no sensitive information
         if self.gpg_key_id:
@@ -56,33 +60,39 @@ class GPGHandler:
         try:
             # FIRST: Import into builder user's GNUPGHOME (/home/builder/.gnupg)
             # This is where package signing will actually look for the key
-            builder_gpg_home = Path("/home/builder/.gnupg")
-            builder_gpg_home.mkdir(exist_ok=True, mode=0o700)
+            self.builder_gpg_home = Path("/home/builder/.gnupg")
+            self.builder_gpg_home.mkdir(exist_ok=True, mode=0o700)
             
             # Set ownership to builder user
             try:
-                subprocess.run(['sudo', 'chown', '-R', 'builder:builder', str(builder_gpg_home)], 
+                subprocess.run(['sudo', 'chown', '-R', 'builder:builder', str(self.builder_gpg_home)], 
                              check=False, capture_output=True)
             except Exception:
                 pass  # Continue even if chown fails
             
-            # Prepare environment for builder's GPG
-            builder_env = os.environ.copy()
-            builder_env['GNUPGHOME'] = str(builder_gpg_home)
+            # Prepare environment for builder's GPG (stored for later use)
+            self.builder_gpg_env = {
+                'HOME': '/home/builder',
+                'GNUPGHOME': str(self.builder_gpg_home),
+            }
             
-            # Import the private key into builder's keyring
+            # Import the private key into builder's keyring using explicit env via sudo
             if isinstance(self.gpg_private_key, bytes):
                 key_input = self.gpg_private_key
             else:
                 key_input = self.gpg_private_key.encode('utf-8')
             
             logger.info("Importing GPG key into builder user's keyring...")
+            # Build command: sudo -u builder env HOME=/home/builder GNUPGHOME=/home/builder/.gnupg gpg --batch --import
+            env_vars = f"HOME={shlex.quote(self.builder_gpg_env['HOME'])} GNUPGHOME={shlex.quote(self.builder_gpg_env['GNUPGHOME'])}"
+            import_cmd = f'sudo -u builder env {env_vars} gpg --batch --import'
+            
             import_process = subprocess.run(
-                ['sudo', '-u', 'builder', 'gpg', '--batch', '--import'],
+                import_cmd,
+                shell=True,
                 input=key_input,
                 capture_output=True,
                 text=False,
-                env=builder_env,
                 check=False
             )
             
@@ -92,12 +102,12 @@ class GPGHandler:
                 # Don't fail yet - try temporary directory as fallback
             
             # Verify key exists in builder's keyring
-            verify_cmd = ['sudo', '-u', 'builder', 'gpg', '--list-secret-keys', '--with-colons', self.gpg_key_id]
+            verify_cmd = f'sudo -u builder env {env_vars} gpg --homedir {shlex.quote(str(self.builder_gpg_home))} --list-secret-keys --with-colons {shlex.quote(self.gpg_key_id)}'
             verify_process = subprocess.run(
                 verify_cmd,
+                shell=True,
                 capture_output=True,
                 text=True,
-                env=builder_env,
                 check=False
             )
             
@@ -114,12 +124,13 @@ class GPGHandler:
                             break
                 
                 if fingerprint:
+                    trust_cmd = f'sudo -u builder env {env_vars} gpg --homedir {shlex.quote(str(self.builder_gpg_home))} --import-ownertrust'
                     trust_process = subprocess.run(
-                        ['sudo', '-u', 'builder', 'gpg', '--import-ownertrust'],
+                        trust_cmd,
+                        shell=True,
                         input=f"{fingerprint}:6:\n".encode('utf-8'),
                         capture_output=True,
                         text=False,
-                        env=builder_env,
                         check=False
                     )
                     if trust_process.returncode == 0:
@@ -133,6 +144,7 @@ class GPGHandler:
             
             # Set environment for temporary GPG
             env = os.environ.copy()
+            env['HOME'] = "/tmp"          # Avoid /github/home
             env['GNUPGHOME'] = temp_gpg_home
             
             # Import the private key into temporary keyring
@@ -302,6 +314,9 @@ class GPGHandler:
             
         except Exception as e:
             logger.error(f"Error importing GPG key: {e}")
+            # Disable signing on any unexpected failure
+            self.gpg_enabled = False
+            self.sign_packages_enabled = False
             if 'temp_gpg_home' in locals():
                 shutil.rmtree(temp_gpg_home, ignore_errors=True)
             return False
@@ -316,11 +331,18 @@ class GPGHandler:
         if not self.gpg_enabled or not self.gpg_key_id:
             return False
         
+        if not self.builder_gpg_env or not self.builder_gpg_home:
+            logger.error("Builder GPG environment not initialized")
+            return False
+        
         try:
-            # Check if builder user can list the secret key
-            cmd = ['sudo', '-u', 'builder', 'gpg', '--list-secret-keys', '--with-colons', self.gpg_key_id]
+            # Check if builder user can list the secret key using explicit env
+            env_vars = f"HOME={shlex.quote(self.builder_gpg_env['HOME'])} GNUPGHOME={shlex.quote(self.builder_gpg_env['GNUPGHOME'])}"
+            cmd = f'sudo -u builder env {env_vars} gpg --homedir {shlex.quote(str(self.builder_gpg_home))} --list-secret-keys --with-colons {shlex.quote(self.gpg_key_id)}'
+            
             result = subprocess.run(
                 cmd,
+                shell=True,
                 capture_output=True,
                 text=True,
                 check=False
@@ -334,8 +356,8 @@ class GPGHandler:
             if 'fpr:' not in result.stdout:
                 logger.error(f"Secret key {self.gpg_key_id} not found in builder's keyring")
                 # Try to list all keys for debugging
-                debug_cmd = ['sudo', '-u', 'builder', 'gpg', '--list-secret-keys']
-                debug_result = subprocess.run(debug_cmd, capture_output=True, text=True, check=False)
+                debug_cmd = f'sudo -u builder env {env_vars} gpg --homedir {shlex.quote(str(self.builder_gpg_home))} --list-secret-keys'
+                debug_result = subprocess.run(debug_cmd, shell=True, capture_output=True, text=True, check=False)
                 if debug_result.returncode == 0:
                     logger.info(f"Builder's available secret keys:\n{debug_result.stdout}")
                 return False
@@ -347,13 +369,15 @@ class GPGHandler:
             logger.error(f"Error verifying builder GPG access: {e}")
             return False
     
-    def _verify_signature(self, package_path: Path, sig_path: Path) -> bool:
+    def _verify_signature(self, package_path: Path, sig_path: Path, env=None, homedir=None) -> bool:
         """
         Verify a GPG signature
         
         Args:
             package_path: Path to the package file
             sig_path: Path to the signature file
+            env: Environment dictionary for GPG (used only for repo signing, not builder)
+            homedir: Optional explicit homedir for GPG
             
         Returns:
             True if signature is valid, False otherwise
@@ -366,32 +390,45 @@ class GPGHandler:
             logger.error(f"Signature file not found: {sig_path}")
             return False
         
-        try:
-            verify_cmd = [
-                'gpg', '--verify',
-                str(sig_path),
-                str(package_path)
-            ]
+        # For builder context (package signing verification), use explicit env command
+        if env is self.builder_gpg_env or homedir == self.builder_gpg_home:
+            # Builder context: use sudo -u builder env with explicit HOME/GNUPGHOME
+            if not self.builder_gpg_env or not self.builder_gpg_home:
+                logger.error("Builder GPG environment not available for verification")
+                return False
+            
+            env_vars = f"HOME={shlex.quote(self.builder_gpg_env['HOME'])} GNUPGHOME={shlex.quote(self.builder_gpg_env['GNUPGHOME'])}"
+            verify_cmd = f'sudo -u builder env {env_vars} gpg --homedir {shlex.quote(str(self.builder_gpg_home))} --verify {shlex.quote(str(sig_path))} {shlex.quote(str(package_path))}'
+            
+            verify_process = subprocess.run(
+                verify_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+        else:
+            # Repository signing verification: use the provided env (or default)
+            verify_cmd = ['gpg', '--verify']
+            if homedir:
+                verify_cmd.extend(['--homedir', str(homedir)])
+            verify_cmd.extend([str(sig_path), str(package_path)])
             
             verify_process = subprocess.run(
                 verify_cmd,
                 capture_output=True,
                 text=True,
-                env=self.gpg_env if hasattr(self, 'gpg_env') else None,
+                env=env,
                 check=False
             )
-            
-            if verify_process.returncode == 0:
-                logger.debug(f"✅ Signature verification passed for {package_path.name}")
-                return True
-            else:
-                logger.error(f"❌ Signature verification failed for {package_path.name}")
-                if verify_process.stderr:
-                    logger.error(f"   Error: {verify_process.stderr[:200]}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Error verifying signature for {package_path.name}: {e}")
+        
+        if verify_process.returncode == 0:
+            logger.debug(f"✅ Signature verification passed for {package_path.name}")
+            return True
+        else:
+            logger.error(f"❌ Signature verification failed for {package_path.name}")
+            if verify_process.stderr:
+                logger.error(f"   Error: {verify_process.stderr[:200]}")
             return False
     
     def sign_package(self, package_path):
@@ -436,20 +473,22 @@ class GPGHandler:
             logger.info(f"   Using GPG key: {self.gpg_key_id}")
             logger.info(f"   Output signature: {sig_file.name}")
             
-            # Create detached signature with --no-armor (binary signature)
-            # Use sudo -u builder to ensure correct user context
-            sign_cmd = [
-                'sudo', '-u', 'builder', 'gpg',
-                '--detach-sign', '--no-armor',
-                '--default-key', self.gpg_key_id,
-                '--output', str(sig_file),
-                str(package_path_obj)
-            ]
+            # Build command: sudo -u builder env HOME=/home/builder GNUPGHOME=/home/builder/.gnupg gpg --homedir ... --detach-sign ...
+            env_vars = f"HOME={shlex.quote(self.builder_gpg_env['HOME'])} GNUPGHOME={shlex.quote(self.builder_gpg_env['GNUPGHOME'])}"
+            sign_cmd = (
+                f'sudo -u builder env {env_vars} gpg '
+                f'--homedir {shlex.quote(str(self.builder_gpg_home))} '
+                f'--detach-sign --no-armor '
+                f'--default-key {shlex.quote(self.gpg_key_id)} '
+                f'--output {shlex.quote(str(sig_file))} '
+                f'{shlex.quote(str(package_path_obj))}'
+            )
             
-            logger.info(f"   Command: {' '.join(sign_cmd)}")
+            logger.info(f"   Command: {sign_cmd}")
             
             sign_process = subprocess.run(
                 sign_cmd,
+                shell=True,
                 capture_output=True,
                 text=True,
                 check=False
@@ -463,8 +502,10 @@ class GPGHandler:
                     sig_size = sig_file.stat().st_size
                     logger.info(f"   Signature file size: {sig_size} bytes")
                     
-                    # REQUIRED: Verify the signature immediately
-                    if self._verify_signature(package_path_obj, sig_file):
+                    # REQUIRED: Verify the signature immediately using builder environment
+                    if self._verify_signature(package_path_obj, sig_file,
+                                             env=self.builder_gpg_env,
+                                             homedir=self.builder_gpg_home):
                         logger.info(f"✅ Signature verification passed for {package_path_obj.name}")
                         return True
                     else:
@@ -513,7 +554,10 @@ class GPGHandler:
             
             if package_file.exists():
                 logger.debug(f"🔍 Verifying signature: {sig_file.name}")
-                if self._verify_signature(package_file, sig_file):
+                # Use builder environment for package signature verification
+                if self._verify_signature(package_file, sig_file,
+                                         env=self.builder_gpg_env,
+                                         homedir=self.builder_gpg_home):
                     results[package_file.name] = True
                 else:
                     results[package_file.name] = False
@@ -588,8 +632,10 @@ class GPGHandler:
                 if sign_process.returncode == 0:
                     logger.info(f"✅ Created signature: {sig_file.name}")
                     
-                    # Verify the signature
-                    if self._verify_signature(file_to_sign, sig_file):
+                    # Verify the signature using temporary GPG environment
+                    if self._verify_signature(file_to_sign, sig_file,
+                                             env=self.gpg_env,
+                                             homedir=self.gpg_home):
                         signed_count += 1
                     else:
                         # Delete invalid signature

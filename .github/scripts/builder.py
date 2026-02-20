@@ -1,6 +1,6 @@
 """
 Main Orchestration Script for Arch Linux Package Builder
-WITH FAIL-SAFE GATES
+WITH NON-BLOCKING HOKIBOT AND STAGING PUBLISH + SAFETY UPGRADES
 """
 
 import os
@@ -8,6 +8,9 @@ import sys
 import logging
 import subprocess
 import tempfile
+import random
+import string
+import datetime
 from pathlib import Path
 from typing import List, Tuple, Dict, Set
 
@@ -44,6 +47,8 @@ try:
     
     from modules.gpg.gpg_handler import GPGHandler
     
+    from modules.hokibot.hokibot import HokibotRunner
+    
     MODULES_LOADED = True
 except ImportError as e:
     logger.error(f"Failed to import modules: {e}")
@@ -52,7 +57,7 @@ except ImportError as e:
 
 
 class PackageBuilderOrchestrator:
-    """Main orchestrator coordinating all phases WITH FAIL-SAFE GATES"""
+    """Main orchestrator coordinating all phases WITH NON-BLOCKING HOKIBOT AND STAGING PUBLISH + SAFETY UPGRADES"""
     
     def __init__(self):
         """Initialize orchestrator with all modules"""
@@ -92,11 +97,11 @@ class PackageBuilderOrchestrator:
         
         # State tracking
         self.vps_files = []
-        self.vps_packages = []  # NEW: Separate list for package files only
+        self.vps_packages = []
         self.allowlist = set()
         self.built_packages = []
         self.skipped_packages = []
-        self.desired_inventory = set()  # NEW: Desired inventory for cleanup guard
+        self.desired_inventory = set()
         
         # GATE STATE TRACKING
         self.gate_state = {
@@ -104,12 +109,17 @@ class PackageBuilderOrchestrator:
             'database_success': False,
             'signature_success': False,
             'upload_success': False,
+            'up3_success': False,
+            'promotion_success': False,   # NEW: staging promotion success
             'destructive_cleanup_allowed': False
         }
         
         # Post-repo-enable pacman -Sy tracking
         self.post_repo_enable_sy_count = 0
         self.post_repo_enable_sy_ran = False
+        
+        # Staging cleanup tracking
+        self.current_run_id = None
         
         logger.info("PackageBuilderOrchestrator initialized")
     
@@ -141,9 +151,6 @@ class PackageBuilderOrchestrator:
         self.database_manager = DatabaseManager(repo_config)
         self.version_tracker = VersionTracker(repo_config)
         
-        # AUTHORITATIVE: CleanupManager handles all cleanup, SmartCleanup is internal helper
-        # Do NOT instantiate SmartCleanup here - let CleanupManager use it internally
-        
         # Build modules
         self.artifact_manager = ArtifactManager()
         self.build_tracker = BuildTracker()
@@ -151,46 +158,95 @@ class PackageBuilderOrchestrator:
         # GPG Handler
         self.gpg_handler = GPGHandler(self.sign_packages)
         
+        # EARLY GPG INIT: Import key immediately if GPG is enabled.
+        # This ensures builder environment is ready before any signing attempts.
+        if self.gpg_handler.gpg_enabled:
+            logger.info("Initializing GPG early...")
+            if not self.gpg_handler.import_gpg_key():
+                logger.warning("GPG key import failed, continuing without package signing")
+        else:
+            logger.info("GPG signing disabled (no key configured)")
+        
         # Shell executor
         self.shell_executor = ShellExecutor(self.debug_mode)
         
-        # Package builder - initialized without vps_files first, will be set in phase_i_vps_sync
+        # Package builder - pass the existing gpg_handler
+        self._ensure_output_directory()
+        
         self.package_builder = create_package_builder(
             packager_id=self.packager_id,
             output_dir=self.output_dir,
+            gpg_handler=self.gpg_handler,          # Pass the initialized handler
             gpg_key_id=self.gpg_key_id,
             gpg_private_key=self.gpg_private_key,
             sign_packages=self.sign_packages,
             debug_mode=self.debug_mode,
-            version_tracker=self.version_tracker  # Pass version tracker
+            version_tracker=self.version_tracker,
+            build_tracker=self.build_tracker
         )
+        
+        # Initialize HokibotRunner
+        self.hokibot_runner = HokibotRunner(debug_mode=self.debug_mode)
         
         logger.info("All modules initialized successfully")
     
-    def _run_post_repo_enable_pacman_sy(self) -> bool:
+    def _ensure_output_directory(self):
+        """Ensure output directory exists with proper ownership and permissions."""
+        try:
+            self.output_dir.mkdir(exist_ok=True, parents=True)
+            self.output_dir.chmod(0o755)
+            subprocess.run(['chown', '-R', 'builder:builder', str(self.output_dir)], check=False)
+            
+            test_file = self.output_dir / ".write_test"
+            try:
+                test_file.touch()
+                test_file.unlink()
+                writable = True
+            except (IOError, OSError):
+                writable = False
+            
+            logger.info(f"OUTPUT_DIR_EXISTS=1 path={self.output_dir} writable={writable}")
+            
+            if not writable:
+                logger.error(f"CRITICAL: Output directory is not writable: {self.output_dir}")
+                subprocess.run(['chmod', '777', str(self.output_dir)], check=False)
+                subprocess.run(['chown', '-R', 'builder:builder', str(self.output_dir)], check=False)
+                    
+        except Exception as e:
+            logger.error(f"Failed to ensure output directory exists: {e}")
+            raise
+    
+    def _generate_run_id(self) -> str:
         """
-        Run post-repo-enable pacman -Sy with exactly-once proof logging.
+        Generate a unique run ID for staging directory.
+        Uses GITHUB_RUN_ID environment variable if available.
         
         Returns:
-            True if executed or skipped appropriately, False if blocked due to already ran
+            String identifier for this CI run
         """
-        # Block if already ran
+        github_run_id = os.getenv('GITHUB_RUN_ID')
+        if github_run_id:
+            return f"run_{github_run_id}"
+        else:
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+            return f"{timestamp}_{suffix}"
+    
+    def _run_post_repo_enable_pacman_sy(self) -> bool:
+        """Run post-repo-enable pacman -Sy with exactly-once proof logging."""
         if self.post_repo_enable_sy_ran:
             logger.info("PACMAN_POST_REPO_ENABLE_SY: BLOCKED (already_ran=true)")
             return False
         
-        # Check if repository has packages to determine if sync is needed
         has_packages = len(self.vps_packages) > 0
         
         if not has_packages:
             logger.info("PACMAN_POST_REPO_ENABLE_SY: SKIP (reason=no_packages_in_repo)")
             return True
         
-        # Log start
         logger.info(f"PACMAN_POST_REPO_ENABLE_SY: START (count_before={self.post_repo_enable_sy_count})")
         
         try:
-            # Run the command
             cmd = "sudo pacman -Sy --noconfirm"
             result = subprocess.run(
                 cmd,
@@ -207,88 +263,80 @@ class PackageBuilderOrchestrator:
                 logger.info(f"PACMAN_POST_REPO_ENABLE_SY: OK (count_after={self.post_repo_enable_sy_count})")
                 return True
             else:
-                # Even on failure, mark as ran to prevent retries
                 self.post_repo_enable_sy_ran = True
-                logger.error(f"PACMAN_POST_REPO_ENABLE_SY: FAILED (error={result.stderr[:200]})")
+                logger.warning(f"PACMAN_POST_REPO_ENABLE_SY: FAILED (error={result.stderr[:200]})")
                 return False
                 
         except subprocess.TimeoutExpired:
             self.post_repo_enable_sy_ran = True
-            logger.error("PACMAN_POST_REPO_ENABLE_SY: TIMEOUT")
+            logger.warning("PACMAN_POST_REPO_ENABLE_SY: TIMEOUT")
             return False
         except Exception as e:
             self.post_repo_enable_sy_ran = True
-            logger.error(f"PACMAN_POST_REPO_ENABLE_SY: EXCEPTION (error={e})")
+            logger.warning(f"PACMAN_POST_REPO_ENABLE_SY: EXCEPTION (error={e})")
             return False
     
     def _evaluate_gates(self):
-        """
-        Evaluate fail-safe gates and determine if destructive cleanup is allowed.
-        
-        G1: Empty-run gate - skip destructive cleanup if no packages built
-        G2: Partial-failure gate - only allow destructive cleanup if:
-            a) repo database generation succeeded AND
-            b) repo signature succeeded AND  
-            c) rsync upload succeeded
-        """
+        """Evaluate fail-safe gates and determine if destructive cleanup is allowed."""
         # G1: Empty-run gate
         if self.gate_state['packages_built'] == 0:
             logger.info("GATE: empty-run (built=0) -> skipping destructive VPS deletions")
             self.gate_state['destructive_cleanup_allowed'] = False
-            return False
-        
-        # G2: Partial-failure gate
-        if (self.gate_state['database_success'] and 
-            self.gate_state['signature_success'] and
-            self.gate_state['upload_success']):
-            self.gate_state['destructive_cleanup_allowed'] = True
-            return True
         else:
-            logger.info("GATE: partial failure -> skipping destructive VPS deletions")
-            self.gate_state['destructive_cleanup_allowed'] = False
-            return False
+            # G2: Partial-failure gate
+            if (self.gate_state['database_success'] and 
+                self.gate_state['signature_success'] and
+                self.gate_state['upload_success']):
+                self.gate_state['destructive_cleanup_allowed'] = True
+            else:
+                logger.info("GATE: partial failure -> skipping destructive VPS deletions")
+                self.gate_state['destructive_cleanup_allowed'] = False
+        
+        # Version prune allowance
+        version_prune_allowed = (
+            self.gate_state['upload_success'] and
+            self.gate_state['database_success'] and
+            (self.gate_state['signature_success'] or not self.gpg_handler.gpg_enabled) and
+            self.gate_state['up3_success']
+        )
+        
+        if version_prune_allowed:
+            logger.info("GATE: version prune allowed (upload+db+signature+UP3 success)")
+        else:
+            logger.info("GATE: version prune blocked (one or more checks failed)")
+        
+        return version_prune_allowed
     
     def phase_i_vps_sync(self) -> bool:
-        """
-        Phase I: VPS State Fetch
-        - List VPS repo files
-        - Sync missing files locally
-        """
+        """Phase I: VPS State Fetch"""
         logger.info("PHASE I: VPS State Fetch")
         
-        # Test SSH connection
         if not self.ssh_client.test_ssh_connection():
             logger.warning("SSH connection test failed")
         
-        # Ensure remote directory exists
         self.ssh_client.ensure_remote_directory()
         
-        # List remote packages
         remote_packages = self.ssh_client.list_remote_packages()
-        self.vps_packages = remote_packages  # Already basenames, ONLY package files
+        self.vps_packages = remote_packages
         
-        # NEW: Also get signatures for completeness check (separate list)
         remote_signatures = self._get_vps_signatures()
-        
-        # Combine for completeness checks (but keep separate for mirror sync)
         self.vps_files = self.vps_packages + remote_signatures
         
         logger.info(f"Found {len(self.vps_packages)} package files and {len(remote_signatures)} signatures on VPS")
         
-        # Run post-repo-enable pacman -Sy if repository has packages
+        self.version_tracker.build_remote_version_index(self.vps_packages)
+        
         if not self._run_post_repo_enable_pacman_sy():
             logger.warning("Post-repo-enable pacman -Sy was blocked or failed")
         
-        # Set VPS files in package builder for completeness checks
         self.package_builder.set_vps_files(self.vps_files)
         
-        # Mirror remote packages locally (PACKAGE FILES ONLY)
         if self.vps_packages:
             logger.info("Mirroring remote packages locally (package files only)...")
             success = self.rsync_client.mirror_remote_packages(
                 self.mirror_temp_dir,
                 self.output_dir,
-                self.vps_packages  # Pass ONLY package files, no signatures
+                self.vps_packages
             )
             if not success:
                 logger.warning("Failed to mirror remote packages")
@@ -302,10 +350,9 @@ class PackageBuilderOrchestrator:
         
         ssh_key_path = "/home/builder/.ssh/id_ed25519"
         if not os.path.exists(ssh_key_path):
-            logger.error(f"SSH key not found")
+            logger.warning(f"SSH key not found")
             return []
         
-        # Get signature files - FIX: include both regular files and symlinks
         ssh_cmd = [
             "ssh",
             f"{self.vps_user}@{self.vps_host}",
@@ -329,7 +376,7 @@ class PackageBuilderOrchestrator:
                 return []
                 
         except Exception as e:
-            logger.error(f"SSH command for signatures failed: {e}")
+            logger.warning(f"SSH command for signatures failed: {e}")
             return []
     
     def get_package_lists(self) -> Tuple[List[str], List[str]]:
@@ -350,21 +397,13 @@ class PackageBuilderOrchestrator:
                 sys.exit(1)
     
     def phase_ii_dynamic_allowlist(self) -> bool:
-        """
-        Phase II: Dynamic Allowlist (Manifest)
-        - Iterate over packages.py entries
-        - Load PKGBUILD (AUR or local)
-        - Extract all pkgname values
-        - Build full allowlist of valid package filenames
-        """
+        """Phase II: Dynamic Allowlist Generation"""
         logger.info("PHASE II: Dynamic Allowlist Generation")
         
         local_packages, aur_packages = self.get_package_lists()
         
-        # Collect all package sources
         package_sources = []
         
-        # Add local packages
         for pkg in local_packages:
             pkg_dir = self.repo_root / pkg
             if pkg_dir.exists():
@@ -372,15 +411,12 @@ class PackageBuilderOrchestrator:
             else:
                 logger.warning(f"Local package directory not found: {pkg}")
         
-        # Add AUR packages
         for pkg in aur_packages:
-            package_sources.append(pkg)  # AUR package names
+            package_sources.append(pkg)
         
-        # Build allowlist using ManifestFactory
         logger.info(f"Processing {len(package_sources)} package sources...")
         self.allowlist = ManifestFactory.build_allowlist(package_sources)
         
-        # NEW: Build desired inventory from PKGBUILDs
         self.desired_inventory = self._build_desired_inventory(package_sources)
         logger.info(f"Desired inventory package names: {len(self.desired_inventory)}")
         if self.desired_inventory:
@@ -392,16 +428,7 @@ class PackageBuilderOrchestrator:
         return len(self.allowlist) > 0
     
     def _build_desired_inventory(self, package_sources: List[str]) -> Set[str]:
-        """
-        Build desired inventory set from all PKGBUILDs.
-        This includes ALL pkgname entries from multi-package PKGBUILDs.
-        
-        Args:
-            package_sources: List of package sources (local paths or AUR names)
-            
-        Returns:
-            Set of all package names that should exist in the repository
-        """
+        """Build desired inventory set from all PKGBUILDs."""
         desired_inventory = set()
         
         for source in package_sources:
@@ -421,37 +448,32 @@ class PackageBuilderOrchestrator:
         return desired_inventory
     
     def phase_iv_version_audit_and_build(self) -> Tuple[List[str], List[str]]:
-        """
-        Phase IV: Version Audit & Build
-        - Compare PKGBUILD version vs mirror version
-        - Build only if source is newer
-        """
+        """Phase IV: Version Audit & Build"""
         logger.info("PHASE IV: Version Audit & Build")
+        
+        index_count, sample_list = self.version_tracker.get_remote_version_index_stats()
+        logger.info(f"REMOTE_VERSION_INDEX_COUNT={index_count}")
+        logger.info(f"REMOTE_VERSION_INDEX_SAMPLE={','.join(sample_list)}")
         
         local_packages, aur_packages = self.get_package_lists()
         
-        # Prepare package lists with remote versions
         local_packages_with_versions = []
         aur_packages_with_versions = []
         
-        # Process local packages
         for pkg_name in local_packages:
             pkg_dir = self.repo_root / pkg_name
             if pkg_dir.exists():
-                remote_version = self.version_tracker.get_remote_version(pkg_name, self.vps_files)
+                remote_version = self.version_tracker.get_remote_version(pkg_name, [])
                 local_packages_with_versions.append((pkg_dir, remote_version))
             else:
                 logger.warning(f"Local package directory not found: {pkg_name}")
         
-        # Process AUR packages
         for pkg_name in aur_packages:
-            remote_version = self.version_tracker.get_remote_version(pkg_name, self.vps_files)
+            remote_version = self.version_tracker.get_remote_version(pkg_name, [])
             aur_packages_with_versions.append((pkg_name, remote_version))
         
-        # NEW: Set desired inventory in version tracker for cleanup guard
         self.version_tracker.set_desired_inventory(self.desired_inventory)
         
-        # Batch audit and build
         built_packages, skipped_packages, failed_packages = (
             self.package_builder.batch_audit_and_build(
                 local_packages=local_packages_with_versions,
@@ -460,12 +482,13 @@ class PackageBuilderOrchestrator:
             )
         )
         
-        # Update state and gate tracking
         self.built_packages = built_packages
         self.skipped_packages = skipped_packages
         self.gate_state['packages_built'] = len(built_packages)
         
-        # Log results
+        hokibot_count = len(self.build_tracker.hokibot_data)
+        logger.info(f"HOKIBOT_DATA_COUNT={hokibot_count}")
+        
         logger.info(f"Build Results:")
         logger.info(f"   Built: {len(built_packages)} packages")
         logger.info(f"   Skipped: {len(skipped_packages)} packages")
@@ -478,14 +501,30 @@ class PackageBuilderOrchestrator:
     
     def phase_v_sign_and_update(self) -> bool:
         """
-        Phase V: Sign and Update WITH FAIL-SAFE GATES
-        - Sign new packages
-        - Update repository database
-        - Upload to VPS with proper cleanup
+        Phase V: Sign and Update WITH STAGING PUBLISH, ATOMIC PROMOTION,
+        PRE‑PROMOTE VERIFICATION AND STALE STAGING CLEANUP.
         """
-        logger.info("PHASE V: Sign and Update WITH FAIL-SAFE GATES")
+        logger.info("PHASE V: Sign and Update WITH STAGING PUBLISH + SAFETY UPGRADES")
         
-        # Check if we have any packages to process
+        # ------------------------------------------------------------
+        # SAFETY NET: Ensure GPG is initialized before any signing
+        # ------------------------------------------------------------
+        if self.gpg_handler.gpg_enabled:
+            # If builder environment is not set up, try import again
+            if not hasattr(self.gpg_handler, 'builder_gpg_env') or self.gpg_handler.builder_gpg_env is None:
+                logger.info("GPG builder environment not initialized – attempting import now...")
+                if not self.gpg_handler.import_gpg_key():
+                    logger.warning("GPG key import failed, continuing without package signing")
+            elif not self.gpg_handler._verify_builder_can_sign():
+                logger.warning("Builder cannot access GPG key – package signing will be disabled")
+                self.gpg_handler.sign_packages_enabled = False
+        # ------------------------------------------------------------
+        
+        # P1) Best‑effort cleanup of stale staging directories (≥24h)
+        logger.info("Cleaning up stale staging directories older than 24 hours...")
+        self.ssh_client.cleanup_old_staging(max_age_hours=24)
+        # ------------------------------------------------------------
+        
         local_packages = list(self.output_dir.glob("*.pkg.tar.*"))
         if not local_packages:
             logger.info("No packages to process")
@@ -494,14 +533,12 @@ class PackageBuilderOrchestrator:
         # Step 1: Clean up old database files
         self.cleanup_manager.cleanup_database_files()
         
-        # Step 2: AUTHORITATIVE CLEANUP: Revalidate output_dir before database generation
+        # Step 2: Authoritative cleanup before database generation
         logger.info("Executing authoritative cleanup before database generation...")
         self.cleanup_manager.revalidate_output_dir_before_database(self.allowlist)
         
-        # Step 3: Generate repository database (track for G2)
+        # Step 3: Generate repository database
         logger.info("Generating repository database...")
-        
-        # CRITICAL: Pass allowlist to database_manager so it can call CleanupManager
         db_success = self.database_manager.generate_full_database(
             self.repo_name,
             self.output_dir,
@@ -511,12 +548,11 @@ class PackageBuilderOrchestrator:
         
         if not db_success:
             logger.error("Failed to generate repository database")
-            # Still proceed with orphan signature sweep (safe)
             self._run_safe_operations_only()
             return False
         
-        # Step 4: Sign repository files if GPG enabled (track for G2)
-        signature_success = True  # Default to success if signing disabled
+        # Step 4: Sign repository files if GPG enabled
+        signature_success = True
         if self.gpg_handler.gpg_enabled:
             logger.info("Signing repository database files...")
             signature_success = self.gpg_handler.sign_repository_files(self.repo_name, str(self.output_dir))
@@ -525,10 +561,8 @@ class PackageBuilderOrchestrator:
         if not signature_success and self.gpg_handler.gpg_enabled:
             logger.warning("Repository signature failed, but continuing...")
         
-        # Step 5: Upload to VPS with --delete to ensure VPS matches local state (track for G2)
-        logger.info("Uploading packages and database to VPS...")
-        
-        # Collect all files to upload
+        # Step 5: STAGING PUBLISH
+        # 5a: Collect all files to upload
         files_to_upload = []
         for pattern in ["*.pkg.tar.*", f"{self.repo_name}.*"]:
             files_to_upload.extend(self.output_dir.glob(pattern))
@@ -539,129 +573,201 @@ class PackageBuilderOrchestrator:
             self._run_safe_operations_only()
             return False
         
-        # Upload using Rsync WITH --delete to remove VPS files not present locally
-        upload_success = self.rsync_client.upload_files(
-            [str(f) for f in files_to_upload],
-            self.output_dir,
-            self.cleanup_manager
-        )
+        # 5b: Generate unique run ID and staging path
+        self.current_run_id = self._generate_run_id()
+        staging_path = f"{self.remote_dir}/.staging/{self.current_run_id}"
+        logger.info(f"STAGING_RUN_ID={self.current_run_id} path={staging_path}")
         
-        # NEW: UP3 POST-UPLOAD VERIFICATION
-        if upload_success:
-            upload_success = self._up3_verify_upload_completeness(files_to_upload)
-        
-        self.gate_state['upload_success'] = upload_success
-        
-        if not upload_success:
-            logger.error("Failed to upload files to VPS")
+        # 5c: Ensure staging directory exists on VPS
+        if not self.ssh_client.ensure_staging_dir(self.current_run_id):
+            logger.error("Failed to create staging directory on VPS")
+            self.gate_state['upload_success'] = False
             self._run_safe_operations_only()
             return False
         
-        # Step 5.5: VPS orphan signature sweep (ALWAYS RUN - SAFE)
+        # 5d: Upload all files to staging directory
+        upload_success = self.rsync_client.upload_files(
+            [str(f) for f in files_to_upload],
+            self.output_dir,
+            self.cleanup_manager,
+            remote_path=staging_path
+        )
+        
+        # 5e: PRE‑PROMOTE VERIFICATION (P0)
+        promotion_success = False
+        if upload_success:
+            expected_basenames = {f.name for f in files_to_upload}
+            verify_ok, missing_files = self.ssh_client.verify_upload(expected_basenames, remote_path=staging_path)
+            
+            if not verify_ok:
+                logger.error(f"STAGING_VERIFY_FAIL: missing {len(missing_files)} files, promotion aborted. Staging left for debugging.")
+                self.gate_state['upload_success'] = False
+                self.gate_state['up3_success'] = False
+                self._run_safe_operations_only()
+                return False
+            
+            logger.info(f"Upload to staging verified. All {len(expected_basenames)} files present.")
+            
+            # 5f: Promote staging to live (with remote lock)
+            logger.info(f"Promoting staging -> live...")
+            promotion_success = self.ssh_client.promote_staging(self.current_run_id)
+            self.gate_state['promotion_success'] = promotion_success
+            
+            if not promotion_success:
+                logger.error(f"Staging promotion FAILED. Staging directory left at {staging_path} for debugging.")
+                # Keep staging dir, do not delete; exit with error later
+        else:
+            logger.error("Upload to staging failed. Promotion aborted.")
+        
+        # 5g: Overall upload success = upload succeeded AND promotion succeeded
+        overall_upload_success = upload_success and promotion_success
+        self.gate_state['upload_success'] = overall_upload_success
+        
+        # 5h: Post‑promotion verification (UP3)
+        up3_success = False
+        if overall_upload_success:
+            # Verify that all expected files are now present in live remote_dir
+            expected_basenames = {f.name for f in files_to_upload}
+            verify_ok, missing_files = self.ssh_client.verify_upload(expected_basenames, self.remote_dir)
+            up3_success = verify_ok
+            self.gate_state['up3_success'] = up3_success
+            
+            if not up3_success:
+                logger.error("UP3 POST-UPLOAD VERIFICATION FAILED: missing files after promotion")
+                # Exit with error later; staging dir already removed
+        else:
+            logger.error("Overall upload/promotion failed; skipping UP3 verification")
+        
+        # 5i: Permission normalization (only if overall success)
+        if overall_upload_success and up3_success:
+            if not self.ssh_client.normalize_permissions():
+                logger.error("VPS permission normalization failed, aborting pipeline")
+                self.gate_state['upload_success'] = False
+                self.gate_state['up3_success'] = False
+                self._run_safe_operations_only()
+                return False
+        else:
+            logger.warning("Skipping permission normalization due to upload/promotion failure")
+        
+        # 5j: EXTRAS CLASSIFICATION (P0) - Log detailed summary of remote files not expected
+        # Get current remote files list after promotion (or after upload if promotion failed)
+        remote_files_after = self.ssh_client.list_remote_files(self.remote_dir)
+        expected_basenames = {f.name for f in files_to_upload}
+        extra_files = [f for f in remote_files_after if f not in expected_basenames]
+        
+        if extra_files:
+            logger.info(f"EXTRAS_CLASSIFICATION: found {len(extra_files)} extra files on VPS")
+            # Classify extras
+            db_artifacts = []
+            meta_files = []
+            pkg_artifacts = []
+            unknown = []
+            
+            repo_prefix = self.repo_name
+            for fname in extra_files:
+                if fname.startswith(f"{repo_prefix}.db") or fname.startswith(f"{repo_prefix}.files"):
+                    db_artifacts.append(fname)
+                elif fname.endswith(('.pub', '.key')):
+                    meta_files.append(fname)
+                elif fname.endswith(('.pkg.tar.zst', '.pkg.tar.xz')):
+                    pkg_artifacts.append(fname)
+                else:
+                    unknown.append(fname)
+            
+            # Log counts and samples
+            logger.info(f"EXTRAS_CATEGORIES: DB/FILES={len(db_artifacts)}, METADATA={len(meta_files)}, PACKAGES={len(pkg_artifacts)}, UNKNOWN={len(unknown)}")
+            if db_artifacts:
+                logger.info(f"EXTRAS_DB_SAMPLE: {db_artifacts[:5]}")
+            if meta_files:
+                logger.info(f"EXTRAS_METADATA_SAMPLE: {meta_files[:5]}")
+            if pkg_artifacts:
+                logger.info(f"EXTRAS_PKG_SAMPLE: {pkg_artifacts[:5]}")
+            if unknown:
+                logger.info(f"EXTRAS_UNKNOWN_SAMPLE: {unknown[:5]}")
+        else:
+            logger.info("EXTRAS_CLASSIFICATION: no extra files found on VPS")
+        
+        # 5k: VPS HYGIENE (if enabled)
+        try:
+            import config
+            if getattr(config, 'ENABLE_VPS_HYGIENE', False):
+                logger.info("VPS_HYGIENE: starting safe VPS cleanup...")
+                dry_run = getattr(config, 'VPS_HYGIENE_DRY_RUN', True)
+                keep_latest = getattr(config, 'KEEP_LATEST_VERSIONS', 1)
+                keep_meta = getattr(config, 'KEEP_VPS_EXTRA_METADATA', True)
+                # New safety flag
+                enable_orphan_sig_delete = getattr(config, 'ENABLE_VPS_ORPHAN_SIG_DELETE', False)
+                
+                self.cleanup_manager.run_vps_hygiene(
+                    remote_dir=self.remote_dir,
+                    repo_name=self.repo_name,
+                    desired_inventory=self.desired_inventory,
+                    keep_latest_versions=keep_latest,
+                    dry_run=dry_run,
+                    keep_extra_metadata=keep_meta,
+                    enable_orphan_sig_delete=enable_orphan_sig_delete   # NEW
+                )
+            else:
+                logger.info("VPS_HYGIENE: disabled by config")
+        except Exception as e:
+            logger.warning(f"VPS_HYGIENE: exception during cleanup (non-fatal): {e}")
+        
+        # Step 6: VPS orphan signature sweep (ALWAYS RUN - SAFE)
         logger.info("Running VPS orphan signature sweep (safe operation)...")
         package_count, signature_count, orphaned_count = self.cleanup_manager.cleanup_vps_orphaned_signatures()
         logger.info(f"VPS orphan sweep complete: {package_count} packages, {signature_count} signatures, deleted {orphaned_count} orphans")
         
-        # Step 6: Evaluate gates and conditionally run destructive cleanup
-        destructive_allowed = self._evaluate_gates()
+        # Step 7: Evaluate gates and conditionally run VPS version prune
+        version_prune_allowed = self._evaluate_gates()
         
-        if destructive_allowed:
-            logger.info("All gates passed - running destructive VPS cleanup...")
-            self.cleanup_manager.server_cleanup(self.version_tracker, self.desired_inventory)
+        if version_prune_allowed:
+            logger.info("All gates passed - running STRICT VPS version prune...")
+            self.cleanup_manager.version_prune_vps(self.version_tracker, self.desired_inventory)
         else:
-            logger.info("Gates blocked destructive VPS cleanup")
+            logger.info("Gates blocked VPS version prune")
         
-        return upload_success
-    
-    def _up3_verify_upload_completeness(self, uploaded_files: List[Path]) -> bool:
-        """
-        UP3 POST-UPLOAD VERIFICATION: Verify all uploaded artifacts exist on VPS
-        
-        Args:
-            uploaded_files: List of local file paths that were uploaded
-            
-        Returns:
-            True if all uploaded files are present on VPS, False otherwise
-        """
-        logger.info("UP3: Starting post-upload VPS verification...")
-        
-        # Get basenames of uploaded files
-        expected_basenames = {f.name for f in uploaded_files}
-        
-        # Fetch fresh VPS inventory (packages + signatures + repo DB/files) - FIX: include symlinks
-        vps_packages = self.ssh_client.list_remote_packages()
-        vps_signatures = self._get_vps_signatures()
-        vps_db_files = self._get_vps_database_files()
-        
-        # Combine all VPS files
-        vps_all_files = set(vps_packages + vps_signatures + vps_db_files)
-        
-        # Check for missing files
-        missing_files = expected_basenames - vps_all_files
-        
-        if not missing_files:
-            logger.info(f"UP3 OK: all uploaded artifacts present on VPS (expected={len(expected_basenames)}, missing=0)")
-            return True
+        # Step 8: Run Hokibot action (non-blocking)
+        if self.build_tracker.hokibot_data:
+            logger.info("Running Hokibot action phase (non-blocking)...")
+            try:
+                hokibot_result = self.hokibot_runner.run(self.build_tracker.hokibot_data)
+                logger.info(f"Hokibot result: {hokibot_result}")
+            except Exception as e:
+                logger.warning(f"Hokibot action failed (non-blocking): {e}")
         else:
-            missing_list = list(missing_files)
-            # Limit to first 20 for logging
-            missing_display = missing_list[:20]
-            logger.error(f"UP3 FAIL: missing on VPS (expected={len(expected_basenames)}, missing={len(missing_files)}) missing: {', '.join(missing_display)}")
-            return False
-    
-    def _get_vps_database_files(self) -> List[str]:
-        """Get database files from VPS - FIX: include both regular files and symlinks"""
-        ssh_key_path = "/home/builder/.ssh/id_ed25519"
-        if not os.path.exists(ssh_key_path):
-            logger.error(f"SSH key not found")
-            return []
+            logger.info("No hokibot data to process")
         
-        # Get database files - FIX: include both regular files and symlinks
-        ssh_cmd = [
-            "ssh",
-            f"{self.vps_user}@{self.vps_host}",
-            rf'find "{self.remote_dir}" -maxdepth 1 \( -type f -o -type l \) \( -name "{self.repo_name}.db*" -o -name "{self.repo_name}.files*" \) -printf "%f\\n" 2>/dev/null || echo "NO_FILES"'
-        ]
-        
-        try:
-            result = subprocess.run(
-                ssh_cmd,
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            
-            if result.returncode == 0:
-                files = [f.strip() for f in result.stdout.split('\n') if f.strip() and f.strip() != 'NO_FILES']
-                return files
-            else:
-                logger.warning(f"SSH find for database files returned error")
-                return []
-                
-        except Exception as e:
-            logger.error(f"SSH command for database files failed: {e}")
-            return []
+        # Return overall success (upload/promotion/verification all succeeded)
+        return overall_upload_success and up3_success
     
     def _run_safe_operations_only(self):
-        """
-        Run only safe operations when gates block destructive cleanup.
-        Currently only orphan signature sweep is considered safe.
-        """
+        """Run only safe operations when gates block destructive cleanup."""
         logger.info("Running safe operations only (orphan signature sweep)...")
         package_count, signature_count, orphaned_count = self.cleanup_manager.cleanup_vps_orphaned_signatures()
         logger.info(f"Safe operations complete: {package_count} packages, {signature_count} signatures, deleted {orphaned_count} orphans")
     
+    def _cleanup_staging_dir(self):
+        """Fail-safe cleanup of the staging directory for this run if it still exists."""
+        if self.current_run_id:
+            logger.info(f"Attempting to clean up staging directory for run {self.current_run_id}...")
+            # Only remove if promotion was not successful (otherwise already removed)
+            if not self.gate_state.get('promotion_success', False):
+                staging_path = f"{self.remote_dir}/.staging/{self.current_run_id}"
+                rm_cmd = f"rm -rf {staging_path}"
+                ssh_cmd = ["ssh", *self.ssh_options, f"{self.vps_user}@{self.vps_host}", rm_cmd]
+                try:
+                    subprocess.run(ssh_cmd, capture_output=True, timeout=30, check=False)
+                    logger.info(f"Staging directory {self.current_run_id} removed during cleanup.")
+                except Exception as e:
+                    logger.warning(f"Could not remove staging directory {self.current_run_id}: {e}")
+            else:
+                logger.debug(f"Staging directory already promoted and removed; no cleanup needed.")
+    
     def run(self) -> int:
-        """Main execution flow WITH FAIL-SAFE GATES"""
-        logger.info("ARCH LINUX PACKAGE BUILDER - MODULAR ORCHESTRATION WITH FAIL-SAFE GATES")
+        """Main execution flow WITH STAGING PUBLISH AND NON-BLOCKING HOKIBOT + SAFETY UPGRADES"""
+        logger.info("ARCH LINUX PACKAGE BUILDER - MODULAR ORCHESTRATION WITH STAGING PUBLISH + SAFETY UPGRADES")
         
         try:
-            # Import GPG key if enabled
-            if self.gpg_handler.gpg_enabled:
-                logger.info("Initializing GPG...")
-                if not self.gpg_handler.import_gpg_key():
-                    logger.warning("GPG key import failed, continuing without signing")
-            
             # Phase I: VPS Sync
             if not self.phase_i_vps_sync():
                 logger.error("Phase I failed")
@@ -675,13 +781,13 @@ class PackageBuilderOrchestrator:
             # Phase IV: Version Audit & Build
             built_packages, skipped_packages = self.phase_iv_version_audit_and_build()
             
-            # Phase V: Sign and Update (with gates)
+            # Phase V: Sign and Update (with staging publish)
             if built_packages or list(self.output_dir.glob("*.pkg.tar.*")):
                 if not self.phase_v_sign_and_update():
                     logger.error("Phase V failed or gates blocked operations")
+                    return 1
             else:
                 logger.info("All packages are up-to-date")
-                # Still run safe operations
                 self._run_safe_operations_only()
             
             # Summary with gate status
@@ -696,11 +802,12 @@ class PackageBuilderOrchestrator:
             logger.info(f"  Database success: {self.gate_state['database_success']}")
             logger.info(f"  Signature success: {self.gate_state['signature_success']}")
             logger.info(f"  Upload success: {self.gate_state['upload_success']}")
+            logger.info(f"  Promotion success: {self.gate_state['promotion_success']}")
+            logger.info(f"  UP3 success: {self.gate_state['up3_success']}")
             logger.info(f"  Destructive cleanup allowed: {self.gate_state['destructive_cleanup_allowed']}")
             logger.info(f"Package signing: {'Enabled' if self.sign_packages else 'Disabled'}")
             logger.info(f"GPG signing: {'Enabled' if self.gpg_handler.gpg_enabled else 'Disabled'}")
             
-            # Print post-repo-enable pacman -Sy count
             logger.info(f"PACMAN_POST_REPO_ENABLE_SY_COUNT={self.post_repo_enable_sy_count}")
             
             if self.built_packages:
@@ -720,6 +827,8 @@ class PackageBuilderOrchestrator:
             # Cleanup GPG
             if hasattr(self, 'gpg_handler'):
                 self.gpg_handler.cleanup()
+            # Fail-safe staging cleanup
+            self._cleanup_staging_dir()
 
 
 def main():
