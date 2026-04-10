@@ -4,7 +4,19 @@ Package definitions for Manjaro Package Builder
 
 # LOCAL packages (from our repository)
 LOCAL_PACKAGES = [
+    "cuda-12.9",
+    "cudnn9.10-cuda12.9",
+#    "lua54",
+#    "lgi",
     "gghelper",
+    "stable-diffusion-webui-forge",
+    "stable-diffusion-webui-forge-cu124",
+    "kohya_ss",
+    "kohya_ss-cu124",
+    "kohya_ss-cu126",
+    "comfyui-git",
+    "comfyui-cu126-git",
+#    "stable-diffusion-webui-forge-sd35",
     "hyperfluent-grub-theme-manjaro",
     "dmgrub-nord-1080p",
     "dmgrub-nord-1080p-ai",
@@ -16,7 +28,8 @@ LOCAL_PACKAGES = [
     "awesome-freedesktop-git",
     "lain-git",
     "awesome-rofi",
-    "awesome-git",
+    "awesome53-git",
+    "awesome54-git",
     "awesome-welcome",
     "tilix-git",
     "nordic-backgrounds",
@@ -30,9 +43,7 @@ LOCAL_PACKAGES = [
 
 # AUR packages (from Arch User Repository)
 AUR_PACKAGES = [
-    "libinput-gestures",
-    "cuda-12.9",
-    "cudnn9.10-cuda12.9",
+    "libinput-gestures",   
     "gtkd",
     "qt5-styleplugins",
     "urxvt-resize-font-git",
@@ -41,24 +52,20 @@ AUR_PACKAGES = [
     "gsconnect",
     "betterlockscreen",
     "nordic-theme",
-    #"nordic-darker-theme",
     "geany-nord-theme",
     "nordzy-icon-theme",
     "oh-my-posh-bin",
     "fish-done",
     "find-the-command",
     "p7zip-gui",
+    "python310",
+    "python313",
     "qownnotes",
     "xorg-font-utils",
     "xnviewmp",
     "simplescreenrecorder",
     "gtkhash-thunar",
     "a4tech-bloody-driver-git"
-    #"nordic-bluish-accent-theme",
-    #"nordic-bluish-accent-standard-buttons-theme",
-    #"nordic-polar-standard-buttons-theme",
-    #"nordic-standard-buttons-theme",
-    #"nordic-darker-standard-buttons-theme"
 ]
 
 # Optionally, you can also define package groups or categories
