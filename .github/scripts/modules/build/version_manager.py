@@ -763,6 +763,14 @@ class VersionManager:
                             logger.info(f"VCS_PLACEHOLDER_OVERRIDE=1 pkg={pkg_dir.name} source={source_version} remote={remote_version}")
                             logger.info(f"[VERSION_COMPARE] Override: BUILD (VCS package with placeholder version)")
                             return True
+                        
+                        # NEW: Also check VCS upstream for non-placeholder VCS packages
+                        # where remote is newer (e.g., Hokibot bumped but upstream changed again)
+                        if is_vcs:
+                            should_build, upstream_reason = self._check_vcs_upstream_for_identical_versions(pkg_dir, pkgver, remote_version)
+                            if should_build:
+                                logger.info(f"[VERSION_COMPARE] Override: BUILD (VCS upstream changed even though remote is newer: {upstream_reason})")
+                                return True
                     
                     return False
             else:
@@ -887,6 +895,14 @@ class VersionManager:
                         logger.info(f"VCS_PLACEHOLDER_OVERRIDE=1 pkg={pkg_dir.name} source={source_version} remote={remote_version}")
                         logger.info(f"[FALLBACK_COMPARE] Override: BUILD (VCS package with placeholder version)")
                         return True
+                    
+                    # NEW: Also check VCS upstream for non-placeholder VCS packages
+                    # where remote is newer (e.g., Hokibot bumped but upstream changed again)
+                    if is_vcs:
+                        should_build, upstream_reason = self._check_vcs_upstream_for_identical_versions(pkg_dir, pkgver, remote_version)
+                        if should_build:
+                            logger.info(f"[FALLBACK_COMPARE] Override: BUILD (VCS upstream changed even though remote is newer: {upstream_reason})")
+                            return True
                 
                 logger.info(f"[FALLBACK_COMPARE] SKIP (pkgrel {pkgrel_int} <= {remote_pkgrel_int})")
                 return False
