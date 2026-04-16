@@ -358,13 +358,17 @@ class VersionManager:
                     # NEW: Handle multi-line source arrays. If the value opens an
                     # array with '(' but the closing ')' is on a later line,
                     # accumulate subsequent lines until the array is closed.
+                    # Only treat a line that *ends* with ')' (after strip) as the
+                    # array terminator — matching ')' anywhere in the line would
+                    # break on quoted URLs/filenames that contain ')' (e.g.
+                    # "file_(v2).tar.gz").
                     if value.startswith('(') and not value.endswith(')'):
                         collected = [value]
                         j = i + 1
                         while j < len(lines):
                             next_line = lines[j].strip()
                             collected.append(next_line)
-                            if next_line.endswith(')') or ')' in next_line:
+                            if next_line.endswith(')'):
                                 break
                             j += 1
                         value = ' '.join(collected)
