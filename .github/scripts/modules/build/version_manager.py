@@ -765,9 +765,21 @@ class VersionManager:
                             return True
                         
                         # NEW: Also check VCS upstream for non-placeholder VCS packages
-                        # where remote is newer (e.g., Hokibot bumped but upstream changed again)
+                        # where remote is newer (e.g., Hokibot bumped but upstream changed again).
+                        # IMPORTANT: In this branch the local PKGBUILD pkgver is STALE relative
+                        # to remote, so its embedded hash would spuriously differ from upstream
+                        # HEAD and cause unnecessary rebuilds. Instead, extract pkgver from the
+                        # remote version and pass THAT, so the hash compared against upstream is
+                        # the one embedded in the remote package. Only BUILD if live upstream
+                        # HEAD is genuinely newer than the remote's embedded hash.
                         if is_vcs:
-                            should_build, upstream_reason = self._check_vcs_upstream_for_identical_versions(pkg_dir, pkgver, remote_version)
+                            remote_pkgver = remote_version
+                            if ':' in remote_pkgver:
+                                remote_pkgver = remote_pkgver.split(':', 1)[1]
+                            if '-' in remote_pkgver:
+                                remote_pkgver = remote_pkgver.rsplit('-', 1)[0]
+                            logger.info(f"VCS_UPSTREAM_CHECK_REMOTE_NEWER pkg={pkg_dir.name} local_pkgver={pkgver} remote_pkgver={remote_pkgver}")
+                            should_build, upstream_reason = self._check_vcs_upstream_for_identical_versions(pkg_dir, remote_pkgver, remote_version)
                             if should_build:
                                 logger.info(f"[VERSION_COMPARE] Override: BUILD (VCS upstream changed even though remote is newer: {upstream_reason})")
                                 return True
@@ -897,9 +909,21 @@ class VersionManager:
                         return True
                     
                     # NEW: Also check VCS upstream for non-placeholder VCS packages
-                    # where remote is newer (e.g., Hokibot bumped but upstream changed again)
+                    # where remote is newer (e.g., Hokibot bumped but upstream changed again).
+                    # IMPORTANT: In this branch the local PKGBUILD pkgver is STALE relative
+                    # to remote, so its embedded hash would spuriously differ from upstream
+                    # HEAD and cause unnecessary rebuilds. Instead, extract pkgver from the
+                    # remote version and pass THAT, so the hash compared against upstream is
+                    # the one embedded in the remote package. Only BUILD if live upstream
+                    # HEAD is genuinely newer than the remote's embedded hash.
                     if is_vcs:
-                        should_build, upstream_reason = self._check_vcs_upstream_for_identical_versions(pkg_dir, pkgver, remote_version)
+                        remote_pkgver = remote_version
+                        if ':' in remote_pkgver:
+                            remote_pkgver = remote_pkgver.split(':', 1)[1]
+                        if '-' in remote_pkgver:
+                            remote_pkgver = remote_pkgver.rsplit('-', 1)[0]
+                        logger.info(f"VCS_UPSTREAM_CHECK_REMOTE_NEWER pkg={pkg_dir.name} local_pkgver={pkgver} remote_pkgver={remote_pkgver}")
+                        should_build, upstream_reason = self._check_vcs_upstream_for_identical_versions(pkg_dir, remote_pkgver, remote_version)
                         if should_build:
                             logger.info(f"[FALLBACK_COMPARE] Override: BUILD (VCS upstream changed even though remote is newer: {upstream_reason})")
                             return True
