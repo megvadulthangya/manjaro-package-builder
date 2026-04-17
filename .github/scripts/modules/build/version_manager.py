@@ -403,12 +403,23 @@ class VersionManager:
                 # Skip array assignments — handled elsewhere.
                 if value.startswith('('):
                     continue
-                # Strip surrounding quotes (single or double).
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                # Strip surrounding quotes (single or double). Remember
+                # whether the value was originally quoted so we don't
+                # later treat a legitimate '#' inside it (e.g. the
+                # fragment in "git+https://...#branch=master") as an
+                # inline shell comment.
+                was_quoted = (
+                    len(value) >= 2
+                    and value[0] == value[-1]
+                    and value[0] in ('"', "'")
+                )
+                if was_quoted:
                     value = value[1:-1]
                 # Strip trailing inline comment (best effort, only for
-                # unquoted values — quoted values already handled above).
-                if '#' in value and not (value[0] in ('"', "'")):
+                # values that were NOT originally quoted — inside a
+                # quoted string '#' is a literal character, not the
+                # start of a shell comment).
+                if '#' in value and not was_quoted:
                     value = value.split('#', 1)[0].rstrip()
                 variables[name] = value
             return variables
